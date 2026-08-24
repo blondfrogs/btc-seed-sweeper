@@ -7,13 +7,20 @@ The only network calls are read-only balance/UTXO/fee lookups. This tool
 NEVER broadcasts. It prints the raw signed transaction hex; you submit it
 yourself (e.g. https://mempool.space/tx/push) when you are ready.
 
-Usage:
+Air-gapped usage (recommended — the seed never touches an online machine):
+    OFFLINE  python sweeper.py addresses               # seed -> addresses.json (public only)
+    ONLINE   python sweeper.py fetch addresses.json    # -> utxos.json  (no seed needed)
+             python sweeper.py fetch --addr 1abc... bc1q...   # or just type addresses
+    OFFLINE  python sweeper.py sign utxos.json <new_address>  # seed + utxos -> raw tx hex
+
+One-machine usage:
     python sweeper.py scan                 # find funds
     python sweeper.py sweep <new_address>  # build + sign, print raw tx hex
 """
 import argparse
 import ctypes
 import gc
+import json
 import getpass
 import resource
 import sys
@@ -153,6 +160,49 @@ def wallet_candidates(mnemonic, passphrase):
                     i += 1
             yield f"Electrum v1 (old) chain {cname}", gen()
 
+def list_addresses(mnemonic, passphrase, per_chain):
+    """Public info only: [{address, kind, path}] for the first per_chain of every chain."""
+    out = []
+    for label, chain in wallet_candidates(mnemonic, passphrase):
+        for _ in range(per_chain):
+            addr, priv, kind, path = next(chain)
+            wipe(priv)
+            out.append({"address": addr, "kind": kind, "path": path})
+    return out
+
+def keys_for(mnemonic, passphrase, wanted):
+    """Return {address: (kind, path, priv)} for the addresses in `wanted`, deriving
+    only as far as needed. Any address the seed can't produce is reported."""
+    wanted = set(wanted)
+    found = {}
+    limit = 2000
+    for label, chain in wallet_candidates(mnemonic, passphrase):
+        for _ in range(limit):
+            if not wanted - set(found):
+                break
+            addr, priv, kind, path = next(chain)
+            if addr in wanted:
+                found[addr] = (kind, path, priv)
+            else:
+                wipe(priv)
+    missing = wanted - set(found)
+    if missing:
+        sys.exit("This seed does not control these addresses (wrong seed/passphrase, "
+                 "or non-standard path):\n  " + "\n  ".join(sorted(missing)))
+    return found
+
+def fetch_utxos(addresses):
+    """Online, no secrets: look up UTXOs for a list of {address, kind?, path?} dicts."""
+    coins = []
+    for i, a in enumerate(addresses):
+        addr = a["address"] if isinstance(a, dict) else a
+        time.sleep(0.15)
+        for u in get_utxos(addr):
+            coins.append({"txid": u["txid"], "vout": u["vout"], "value": u["value"], "address": addr})
+        if (i + 1) % 50 == 0:
+            print(f"  {i+1}/{len(addresses)} checked ...")
+    return coins
+
 def scan(mnemonic, passphrase):
     res = ScanResult()
     any_scheme = False
@@ -244,11 +294,68 @@ def forget(*names, scope):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("scan", help="find funds only")
+    sub.add_parser("scan", help="find funds only (needs seed + network)")
+    a1 = sub.add_parser("addresses", help="OFFLINE: seed -> public address list")
+    a1.add_argument("-o", "--out", default="addresses.json")
+    a1.add_argument("-n", "--per-chain", type=int, default=100, help="addresses per chain (default 100)")
+    f = sub.add_parser("fetch", help="ONLINE, no seed: addresses -> utxos.json")
+    f.add_argument("addresses_file", nargs="?", help="addresses.json from the offline step")
+    f.add_argument("--addr", nargs="+", help="or give addresses directly")
+    f.add_argument("-o", "--out", default="utxos.json")
+    g = sub.add_parser("sign", help="OFFLINE: seed + utxos.json -> raw tx hex")
+    g.add_argument("utxos_file")
+    g.add_argument("address", help="your NEW wallet's receive address")
+    g.add_argument("--fee-rate", type=int, help="sat/vB (default: rate saved by fetch)")
     s = sub.add_parser("sweep", help="build and sign a sweep; prints raw hex, never broadcasts")
     s.add_argument("address", help="your NEW wallet's receive address")
     s.add_argument("--fee-rate", type=int, help="sat/vB (default: current half-hour rate)")
     a = ap.parse_args()
+
+    if a.cmd == "addresses":
+        mnemonic, passphrase = read_secret()
+        addrs = list_addresses(mnemonic, passphrase, a.per_chain)
+        forget("mnemonic", "passphrase", scope=locals())
+        json.dump(addrs, open(a.out, "w"), indent=1)
+        print(f"Wrote {len(addrs)} public addresses to {a.out} (no keys). Take this file online.")
+        return
+
+    if a.cmd == "fetch":
+        addrs = [{"address": x} for x in (a.addr or [])]
+        if a.addresses_file:
+            addrs += json.load(open(a.addresses_file))
+        if not addrs:
+            sys.exit("Give addresses.json or --addr ...")
+        print(f"Fetching UTXOs for {len(addrs)} addresses (read-only) ...")
+        coins = fetch_utxos(addrs)
+        rate = fee_rate()
+        json.dump({"fee_rate": rate, "utxos": coins}, open(a.out, "w"), indent=1)
+        total = sum(c["value"] for c in coins)
+        print(f"Found {len(coins)} coin(s), total {total/1e8:.8f} BTC. Fee rate now {rate} sat/vB.")
+        for c in coins:
+            print(f"  {c['value']/1e8:.8f}  {c['address']}")
+        print(f"Wrote {a.out}. Take this file to the offline machine.")
+        return
+
+    if a.cmd == "sign":
+        _dest_script(a.address)
+        if input("Confirm destination address again (type it): ").strip() != a.address:
+            sys.exit("Addresses do not match. Aborting.")
+        data = json.load(open(a.utxos_file))
+        if not data["utxos"]:
+            sys.exit("No UTXOs in file.")
+        mnemonic, passphrase = read_secret()
+        keys = keys_for(mnemonic, passphrase, {u["address"] for u in data["utxos"]})
+        forget("mnemonic", "passphrase", scope=locals())
+        coins = [Coin(u["txid"], u["vout"], u["value"], u["address"],
+                      keys[u["address"]][0], keys[u["address"]][2], keys[u["address"]][1])
+                 for u in data["utxos"]]
+        rate = a.fee_rate or data.get("fee_rate") or 10
+        tx, send, fee, vb = build_and_sign(coins, a.address, rate)
+        _print_result(tx, coins, a.address, send, fee, vb, rate)
+        for c in coins:
+            wipe(c.priv)
+        forget("coins", "keys", "tx", scope=locals())
+        return
 
     if a.cmd == "sweep":
         _dest_script(a.address)  # validate early, before asking for the seed
@@ -268,20 +375,23 @@ def main():
 
     rate = a.fee_rate or fee_rate()
     tx, send, fee, vb = build_and_sign(res.coins, a.address, rate)
-    raw = tx.serialize()
+    _print_result(tx, res.coins, a.address, send, fee, vb, rate)
+    for c in res.coins:
+        wipe(c.priv)
+    forget("res", "tx", scope=locals())
+
+def _print_result(tx, coins, dest, send, fee, vb, rate):
+    total = sum(c.value for c in coins)
     print("\n=== SWEEP SUMMARY ===")
-    print(f"  inputs : {len(res.coins)}  ({res.total/1e8:.8f} BTC)")
-    print(f"  to     : {a.address}")
+    print(f"  inputs : {len(coins)}  ({total/1e8:.8f} BTC)")
+    print(f"  to     : {dest}")
     print(f"  amount : {send/1e8:.8f} BTC")
     print(f"  fee    : {fee} sats  ({rate} sat/vB, ~{vb} vB)")
     print(f"  txid   : {tx.get_txid()}")
     print("\nRaw signed transaction hex (NOT broadcast — this tool never submits):")
-    print(raw)
+    print(tx.serialize())
     print("\nWhen ready, paste it at https://mempool.space/tx/push (or any node/explorer).")
     print(f"Then track it: https://mempool.space/tx/{tx.get_txid()}")
-    for c in res.coins:
-        wipe(c.priv)
-    forget("res", "tx", "raw", scope=locals())
 
 if __name__ == "__main__":
     main()

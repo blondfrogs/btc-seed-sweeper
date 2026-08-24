@@ -5,13 +5,25 @@ Moves all BTC controlled by an old seed phrase to a new address. Keys never leav
 ## Setup
     python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
-## Use
-1. Look first (read-only, nothing is signed or sent):
-       .venv/bin/python sweeper.py scan
-2. Build and sign the sweep — prints amount/fee/txid and the raw signed hex:
-       .venv/bin/python sweeper.py sweep bc1q...yournewaddress
-3. **This tool never broadcasts.** When you're ready, paste the hex into
+## Air-gapped use (recommended — the seed never touches an online machine)
+
+1. **Offline machine** — derive a public-only address list (no keys are written):
+       python sweeper.py addresses            # -> addresses.json  (default 100 per chain)
+2. **Online machine** — pull UTXOs and the current fee rate, no seed needed:
+       python sweeper.py fetch addresses.json # -> utxos.json
+   If you already know the funded addresses you can skip step 1 entirely:
+       python sweeper.py fetch --addr 1abc... bc1q...
+3. **Offline machine** — enter the seed, sign, get the raw hex:
+       python sweeper.py sign utxos.json bc1q...yournewaddress
+4. **This tool never broadcasts.** Carry the hex back online and paste it into
    https://mempool.space/tx/push (or your own node). Nothing moves until you do.
+
+Move `addresses.json` / `utxos.json` between machines however you like (USB, QR, retyping) —
+they contain only public data.
+
+## One-machine use (simpler, less safe)
+       python sweeper.py scan                      # find funds
+       python sweeper.py sweep bc1q...newaddress   # sign, print raw hex
 
 Supports BIP39 seeds (BIP44 legacy `1...`, BIP49 `3...`, BIP84 `bc1q...`, with optional passphrase)
 and Electrum seeds (old v1 and v2 standard/segwit). Scans receive + change chains with a gap limit of 20.
