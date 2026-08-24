@@ -16,12 +16,13 @@ as hex. **It never broadcasts.** You submit the hex yourself when you're ready.
 2. [What you need](#what-you-need)
 3. [Setup](#setup)
 4. [Step-by-step: air-gapped sweep (recommended)](#step-by-step-air-gapped-sweep-recommended)
-5. [One-machine mode (simpler, less safe)](#one-machine-mode-simpler-less-safe)
-6. [Which wallets does it support?](#which-wallets-does-it-support)
-7. [Troubleshooting](#troubleshooting)
-8. [Security model](#security-model)
-9. [Command reference](#command-reference)
-10. [Verifying the dependencies yourself](#verifying-the-dependencies-yourself)
+5. [Already know the address? Skip the scan](#already-know-the-address-skip-the-scan)
+6. [One-machine mode (simpler, less safe)](#one-machine-mode-simpler-less-safe)
+7. [Which wallets does it support?](#which-wallets-does-it-support)
+8. [Troubleshooting](#troubleshooting)
+9. [Security model](#security-model)
+10. [Command reference](#command-reference)
+11. [Verifying the dependencies yourself](#verifying-the-dependencies-yourself)
 
 ---
 
@@ -184,6 +185,27 @@ Shut the offline machine **down** (not just close the terminal) to clear RAM. De
 
 ---
 
+## Already know the address? Skip the scan
+
+If you know which old address holds the coins (from a block explorer, an old screenshot, a
+backup…), you never need to generate an address list. The seed is used exactly once, to sign.
+
+Air-gapped:
+```bash
+# online, no seed
+.venv/bin/python sweeper.py fetch --addr 1YourOldAddr…
+# offline
+.venv/bin/python sweeper.py sign utxos.json bc1qYourNEWaddr…
+```
+
+One machine:
+```bash
+.venv/bin/python sweeper.py sweep bc1qYourNEWaddr… --addr 1YourOldAddr…
+```
+
+You can pass several old addresses after `--addr`. Coins on all of them go into one
+transaction.
+
 ## One-machine mode (simpler, less safe)
 
 If you accept having the seed on an online machine (e.g. small amount, trusted computer):
@@ -292,8 +314,9 @@ sweeper.py sign utxos.json NEW_ADDRESS [--fee-rate SAT_PER_VB]
 sweeper.py scan
     ONLINE + seed. Walks all derivation chains with a gap limit of 20 and reports balances.
 
-sweeper.py sweep NEW_ADDRESS [--fee-rate SAT_PER_VB]
-    ONLINE + seed. scan + sign in one go. Never broadcasts.
+sweeper.py sweep NEW_ADDRESS [--fee-rate SAT_PER_VB] [--addr OLD_ADDRESS ...]
+    ONLINE + seed. scan + sign in one go. With --addr, skips the scan and sweeps
+    only the given address(es). Never broadcasts.
 ```
 
 Destination address can be `1…`, `3…`, or `bc1q…` (mainnet). Taproot `bc1p…` is not

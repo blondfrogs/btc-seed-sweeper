@@ -15,7 +15,8 @@ Air-gapped usage (recommended — the seed never touches an online machine):
 
 One-machine usage:
     python sweeper.py scan                 # find funds
-    python sweeper.py sweep <new_address>  # build + sign, print raw tx hex
+    python sweeper.py sweep <new_address>  # scan whole seed, sign, print raw tx hex
+    python sweeper.py sweep <new_address> --addr <old_address>   # sweep one known address
 """
 import argparse
 import ctypes
@@ -321,6 +322,8 @@ def main():
     s = sub.add_parser("sweep", help="build and sign a sweep; prints raw hex, never broadcasts")
     s.add_argument("address", help="your NEW wallet's receive address")
     s.add_argument("--fee-rate", type=int, help="sat/vB (default: current half-hour rate)")
+    s.add_argument("--addr", nargs="+", metavar="OLD_ADDRESS",
+                   help="sweep only these known address(es) instead of scanning the whole seed")
     a = ap.parse_args()
 
     if a.cmd == "addresses":
@@ -384,11 +387,26 @@ def main():
         if confirm != a.address:
             sys.exit("Addresses do not match. Aborting.")
 
-    mnemonic, passphrase = read_secret()
-    print("\nScanning (read-only) ...")
-    res = scan(mnemonic, passphrase)
-    del mnemonic, passphrase        # words no longer needed
-    gc.collect()
+    if a.cmd == "sweep" and a.addr:
+        # Known-address mode: look up coins first (no seed), then derive only those keys.
+        print(f"Fetching UTXOs for {len(a.addr)} address(es) (read-only) ...")
+        utxos = dedupe_utxos(fetch_utxos(list(dict.fromkeys(a.addr))))
+        if not utxos:
+            sys.exit("No coins found on the given address(es).")
+        mnemonic, passphrase = read_secret()
+        keys = keys_for(mnemonic, passphrase, {u["address"] for u in utxos})
+        del mnemonic, passphrase
+        gc.collect()
+        res = ScanResult(coins=[Coin(u["txid"], u["vout"], u["value"], u["address"],
+                                     keys[u["address"]][0], keys[u["address"]][2], keys[u["address"]][1])
+                                for u in utxos], checked=len(a.addr))
+        del keys
+    else:
+        mnemonic, passphrase = read_secret()
+        print("\nScanning (read-only) ...")
+        res = scan(mnemonic, passphrase)
+        del mnemonic, passphrase        # words no longer needed
+        gc.collect()
     print(f"\nChecked {res.checked} addresses. Found {len(res.coins)} coin(s), total {res.total/1e8:.8f} BTC")
     for c in res.coins:
         print(f"  {c.value/1e8:.8f}  {c.address}  ({c.path})")
