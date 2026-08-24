@@ -43,7 +43,7 @@ def coins_for(m, pw, items):   # items: (scheme, chain, index, value)
 coins = coins_for(BIP,"",[("bip44",0,0,100000),("bip49",1,2,100000),("bip84",0,5,100000),("bip84",0,5,70000)]) \
       + coins_for(EL2S,"Pw",[("el2std",0,1,100000)]) + coins_for(EL2W,"",[("el2sw",1,0,100000)]) + coins_for(EL1,"",[("el1",0,0,100000)])
 prevouts=[{"script_pubkey": spk_for_address(c.address).hex(), "value": c.value} for c in coins]
-tx,send,fee,vb = build_and_sign(coins, DEST, 7)
+tx,send,fee,vb,_,_,_ = build_and_sign(coins, DEST, 7)
 kinds = verify(tx.serialize(), prevouts)
 print("  verified inputs:", kinds)
 assert all(not any(c.priv) for c in coins), "keys zeroed"
@@ -70,6 +70,38 @@ sig=pk.sign_segwit_input(t,0,pub.get_segwit_address().to_script_pub_key(),c.valu
 t.witnesses.append(TxWitnessInput([sig,pub.to_hex()]))
 try: verify(t.serialize(),[{"script_pubkey":spk_for_address(c.address).hex(),"value":c.value}]); print("  FAIL: bug not caught"); sys.exit(1)
 except ValueError as e: print(f"  caught ✓ ({e})")
+
+print("== D3. --test / --amount partial send ==")
+coins = coins_for(BIP,"",[("bip84",0,0,30000),("bip44",0,1,200000),("bip49",0,2,50000)])
+allc = list(coins)
+tx,send,fee,vb,change,change_addr,used = build_and_sign(coins, DEST, 5, parse_amount("0.0001"))
+assert send==10000 and len(used)==1 and used[0].value==200000, "largest single input should cover it"
+assert change_addr==used[0].address and change==200000-10000-fee, (change, fee)
+prev=[{"script_pubkey": spk_for_address(c.address).hex(), "value": c.value} for c in used]
+verify(tx.serialize(), prev)
+ptx=parse(tx.serialize()); assert len(ptx["outs"])==2
+assert ptx["outs"][0]["spk"]==spk_for_address(DEST) and ptx["outs"][0]["value"]==10000
+assert ptx["outs"][1]["spk"]==spk_for_address(change_addr) and ptx["outs"][1]["value"]==change
+untouched=[c for c in allc if c not in used]; assert len(untouched)==2 and all(any(c.priv) for c in untouched)
+print(f"  1 input used, change {change} sats back to old address, 2 coins untouched (keys intact) ✓")
+# dust change: amount nearly equals the only input
+c1 = coins_for(BIP,"",[("bip84",0,3,10600)])   # change would be ~435 sats < dust
+tx,send,fee,vb,change,change_addr,used = build_and_sign(c1, DEST, 1, 10000)
+assert change==0 and change_addr is None and len(parse(tx.serialize())["outs"])==1
+verify(tx.serialize(), [{"script_pubkey": spk_for_address(c1[0].address).hex(), "value": 10600}])
+print("  dust change folded into fee, single output ✓")
+# multi-input selection
+c3 = coins_for(BIP,"",[("bip84",0,4,6000),("bip84",0,5,6000),("bip84",0,6,6000)])
+tx,send,fee,vb,change,change_addr,used = build_and_sign(c3, DEST, 1, 10000)
+assert len(used)==2; verify(tx.serialize(), [{"script_pubkey": spk_for_address(c.address).hex(), "value": c.value} for c in used])
+print("  needs 2 of 3 inputs -> selects 2 ✓")
+try: build_and_sign(coins_for(BIP,"",[("bip84",0,7,5000)]), DEST, 1, 10000); print("  FAIL"); sys.exit(1)
+except SystemExit as e: assert "Not enough funds" in str(e); print("  insufficient funds refused ✓")
+for bad in ("0.000001","abc","0"):
+    try: parse_amount(bad); print("  FAIL", bad); sys.exit(1)
+    except SystemExit: pass
+assert parse_amount("0.0001")==10000 and parse_amount("1")==100000000
+print("  amount parsing ✓")
 
 print("== F. fee-rate validation ==")
 for bad in (0,-5,None,"10",2.5):

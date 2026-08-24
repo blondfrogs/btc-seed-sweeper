@@ -196,6 +196,32 @@ If an address in `utxos.json` has no `scheme/chain/index` (because you used `--a
 `sign` searches the first 2000 addresses of every chain for it. For a very heavily used
 wallet, raise that with `--max-index 10000`.
 
+#### Do a test run first (recommended)
+
+Old coins, new tool — send a tiny amount first. Add `--test` to the sign step:
+
+```bash
+.venv/bin/python sweeper.py sign utxos.json bc1qYourNEWaddress… --test
+```
+
+This sends **0.0001 BTC** to your new address and returns the change to the *old* address it
+came from (which your seed controls), using as few inputs as possible; every other coin is
+left untouched. The summary says so explicitly:
+
+```
+=== TEST / PARTIAL SEND SUMMARY ===
+  inputs : 1  (0.30000000 BTC)
+  to     : bc1qYourNEWaddress…
+  amount : 0.00010000 BTC
+  change : 0.29989320 BTC  back to 1LqBGSKuX5yY… (your old address)
+  fee    : 680 sats  (4 sat/vB, ~170 vB)
+  untouched: 1 other coin(s), 0.01500000 BTC, still on the old addresses
+```
+
+Broadcast it (Step 4), wait for it to confirm and show up in your new wallet, then
+**re-run Step 2 (`fetch`)** — the coins have changed — and do the real sweep without
+`--test`. `--amount 0.005` works the same way with any amount you choose.
+
 ### Step 4 — ONLINE: broadcast it yourself
 
 Get the hex to an online device (retype it, QR it, or USB it — it's already signed and
@@ -233,7 +259,7 @@ One machine:
 ```
 
 You can pass several old addresses after `--addr`. Coins on all of them go into one
-transaction.
+transaction. `--test` / `--amount` work here too.
 
 ## One-machine mode (simpler, less safe)
 
@@ -332,6 +358,8 @@ What this tool does to protect you:
 - **Never broadcasts.** There is no code path that submits a transaction. You do that.
 - **Seed never needs to be online.** `fetch` works from addresses alone.
 - **Whole balance to one address you control** — no change output that could be stranded.
+  In `--test`/`--amount` mode the change goes back to the old address it came from, which
+  the same seed controls.
 - **Destination is double-entered** and validated before the seed is requested.
 - **Every signature is independently verified before output.** `verify_tx.py` is a
   separate, from-spec implementation of the legacy and BIP143 sighash algorithms (validated
@@ -369,13 +397,14 @@ sweeper.py addresses [-o addresses.json] [-n PER_CHAIN]
 sweeper.py fetch [addresses.json] [--addr A1 A2 ...] [-o utxos.json]
     ONLINE, no seed. Looks up UTXOs and current fee rate for the given addresses.
 
-sweeper.py sign utxos.json NEW_ADDRESS [--fee-rate SAT_PER_VB] [--max-index N]
+sweeper.py sign utxos.json NEW_ADDRESS [--fee-rate SAT_PER_VB] [--max-index N] [--test | --amount BTC]
     OFFLINE. Seed + utxos -> signed, self-verified raw tx hex. Never broadcasts.
+    --test sends 0.0001 BTC (change back to the old address); --amount BTC any amount.
 
 sweeper.py scan
     ONLINE + seed. Walks all derivation chains with a gap limit of 20 and reports balances.
 
-sweeper.py sweep NEW_ADDRESS [--fee-rate SAT_PER_VB] [--addr OLD_ADDRESS ...] [--max-index N]
+sweeper.py sweep NEW_ADDRESS [--fee-rate SAT_PER_VB] [--addr OLD_ADDRESS ...] [--max-index N] [--test | --amount BTC]
     ONLINE + seed. scan + sign in one go. With --addr, skips the scan and sweeps
     only the given address(es). Never broadcasts.
 ```

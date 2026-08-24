@@ -13,6 +13,9 @@ Air-gapped usage (recommended — the seed never touches an online machine):
              python sweeper.py fetch --addr 1abc... bc1q...   # or just type addresses
     OFFLINE  python sweeper.py sign utxos.json <new_address>  # seed + utxos -> raw tx hex
 
+Test first (recommended): add --test to `sign` or `sweep` to send only 0.0001 BTC and
+return the change to the old address; once it confirms, re-run fetch and do the real sweep.
+
 One-machine usage:
     python sweeper.py scan                 # find funds
     python sweeper.py sweep <new_address>  # scan whole seed, sign, print raw tx hex
@@ -160,6 +163,20 @@ def check_fee_rate(rate):
                  "Pass --fee-rate, e.g. --fee-rate 10.")
     return rate
 
+
+def parse_amount(text):
+    """'0.0001' (BTC) -> sats, exactly."""
+    from decimal import Decimal, InvalidOperation
+    try:
+        sats = int(Decimal(text) * 100_000_000)
+    except InvalidOperation:
+        sys.exit(f"Bad amount {text!r}; give BTC like 0.0001")
+    if sats <= DUST:
+        sys.exit(f"Amount {text} BTC is below the dust limit ({DUST} sats).")
+    return sats
+
+
+TEST_AMOUNT_BTC = "0.0001"
 
 # ----------------------------------------------------------------------------- derivation
 
@@ -368,23 +385,54 @@ def scan(mnemonic, passphrase):
 
 # ----------------------------------------------------------------------------- transaction
 
-def estimate_vbytes(coins):
-    # overhead 11 + one output 43 + per-input sizes
-    return 11 + 43 + sum(INPUT_VBYTES["p2pkh-uncompressed" if (c.kind == "p2pkh" and not c.compressed)
-                                      else c.kind] for c in coins)
+def estimate_vbytes(coins, n_outputs=1):
+    # overhead 11 + 43 per output (conservative) + per-input sizes
+    return 11 + 43 * n_outputs + sum(INPUT_VBYTES["p2pkh-uncompressed" if (c.kind == "p2pkh" and not c.compressed)
+                                                  else c.kind] for c in coins)
 
 
-def build_and_sign(coins, dest, rate):
-    check_fee_rate(rate)
-    vb = estimate_vbytes(coins)
-    fee = vb * rate
+def select_inputs(coins, amount, rate):
+    """Fewest inputs (largest first) covering amount + fee for a 2-output tx."""
+    chosen = []
+    for c in sorted(coins, key=lambda c: c.value, reverse=True):
+        chosen.append(c)
+        if sum(x.value for x in chosen) >= amount + estimate_vbytes(chosen, 2) * rate:
+            return chosen
     total = sum(c.value for c in coins)
-    send = total - fee
-    if send <= DUST:
-        sys.exit(f"After a {fee} sat fee nothing worth sending remains ({total} sats total).")
+    sys.exit(f"Not enough funds: {total} sats available, need {amount} sats plus fee.")
+
+
+def build_and_sign(coins, dest, rate, amount=None):
+    """Sweep everything to dest, or (amount given) send `amount` sats and return the
+    change to the address the first selected coin came from. Returns
+    (tx, send, fee, vbytes, change, change_addr, coins_used)."""
+    check_fee_rate(rate)
+    change, change_addr = 0, None
+    if amount is None:
+        vb = estimate_vbytes(coins)
+        fee = vb * rate
+        total = sum(c.value for c in coins)
+        send = total - fee
+        if send <= DUST:
+            sys.exit(f"After a {fee} sat fee nothing worth sending remains ({total} sats total).")
+        outs = [TxOutput(send, _dest_script(dest))]
+    else:
+        coins = select_inputs(coins, amount, rate)
+        total = sum(c.value for c in coins)
+        send = amount
+        vb = estimate_vbytes(coins, 2)
+        fee = vb * rate
+        change = total - send - fee
+        change_addr = coins[0].address
+        if change <= DUST:          # not worth a change output; give it to the miner
+            fee += max(change, 0)
+            change, change_addr = 0, None
+            vb = estimate_vbytes(coins, 1)
+        outs = [TxOutput(send, _dest_script(dest))]
+        if change:
+            outs.append(TxOutput(change, _dest_script(change_addr)))
 
     ins = [TxInput(c.txid, c.vout) for c in coins]
-    outs = [TxOutput(send, _dest_script(dest))]
     has_segwit = any(c.kind != "p2pkh" for c in coins)
     tx = Transaction(ins, outs, has_segwit=has_segwit)
 
@@ -432,7 +480,7 @@ def build_and_sign(coins, dest, rate):
     real_vb = verify_tx.vbytes(tx.serialize())
     if real_vb > vb:
         sys.exit(f"INTERNAL ERROR: fee estimate ({vb} vB) below actual size ({real_vb} vB).")
-    return tx, send, fee, real_vb
+    return tx, send, fee, real_vb, change, change_addr, coins
 
 
 def _dest_script(addr):
@@ -457,20 +505,35 @@ def read_secret():
     return m, p
 
 
+def _amount_from_args(a):
+    if getattr(a, "test", False) and a.amount:
+        sys.exit("Use either --test or --amount, not both.")
+    if getattr(a, "test", False):
+        return parse_amount(TEST_AMOUNT_BTC)
+    return parse_amount(a.amount) if a.amount else None
+
+
 def confirm_destination(addr):
     _dest_script(addr)  # validate before asking for anything secret
     if input("Confirm destination address again (type it): ").strip() != addr:
         sys.exit("Addresses do not match. Aborting.")
 
 
-def _print_result(tx, coins, dest, send, fee, vb, rate):
+def _print_result(tx, coins, dest, send, fee, vb, rate, change=0, change_addr=None, untouched=()):
     total = sum(c.value for c in coins)
-    print("\n=== SWEEP SUMMARY ===")
+    print("\n=== " + ("TEST / PARTIAL SEND SUMMARY" if change_addr or untouched else "SWEEP SUMMARY") + " ===")
     print(f"  inputs : {len(coins)}  ({total/1e8:.8f} BTC)")
     print(f"  to     : {dest}")
     print(f"  amount : {send/1e8:.8f} BTC")
+    if change_addr:
+        print(f"  change : {change/1e8:.8f} BTC  back to {change_addr} (your old address)")
     print(f"  fee    : {fee} sats  ({rate} sat/vB, ~{vb} vB)")
     print(f"  txid   : {tx.get_txid()}")
+    if untouched:
+        left = sum(c.value for c in untouched)
+        print(f"  untouched: {len(untouched)} other coin(s), {left/1e8:.8f} BTC, still on the old addresses")
+    if change_addr or untouched:
+        print("\n  After this confirms, re-run `fetch` (the coins have changed) before the real sweep.")
     print("\nRaw signed transaction hex (NOT broadcast — this tool never submits):")
     print(tx.serialize())
     print("\nWhen ready, paste it at https://mempool.space/tx/push (or any node/explorer).")
@@ -521,6 +584,7 @@ def cmd_sign(a):
     if not utxos:
         sys.exit("No UTXOs in file.")
     rate = check_fee_rate(a.fee_rate if a.fee_rate is not None else data.get("fee_rate"))
+    amount = _amount_from_args(a)      # validate before asking for anything secret
     wanted = {}
     for u in utxos:
         loc = {k: u[k] for k in ("scheme", "chain", "index") if k in u}
@@ -532,8 +596,9 @@ def cmd_sign(a):
     coins = coins_from_utxos(utxos, keys)
     del keys
     try:
-        tx, send, fee, vb = build_and_sign(coins, a.address, rate)
-        _print_result(tx, coins, a.address, send, fee, vb, rate)
+        tx, send, fee, vb, change, change_addr, used = build_and_sign(coins, a.address, rate, amount)
+        _print_result(tx, used, a.address, send, fee, vb, rate, change, change_addr,
+                      untouched=[c for c in coins if c not in used])
         del tx
     finally:
         for c in coins:
@@ -543,8 +608,10 @@ def cmd_sign(a):
 
 
 def cmd_scan_or_sweep(a):
+    amount = None
     if a.cmd == "sweep":
         confirm_destination(a.address)
+        amount = _amount_from_args(a)  # validate before asking for anything secret
     res = None
     try:
         if a.cmd == "sweep" and a.addr:
@@ -576,8 +643,9 @@ def cmd_scan_or_sweep(a):
         rate = a.fee_rate if a.fee_rate is not None else fee_rate()
         if rate is None:
             sys.exit("Could not fetch the current fee rate; re-run with --fee-rate N.")
-        tx, send, fee, vb = build_and_sign(res.coins, a.address, rate)
-        _print_result(tx, res.coins, a.address, send, fee, vb, rate)
+        tx, send, fee, vb, change, change_addr, used = build_and_sign(res.coins, a.address, rate, amount)
+        _print_result(tx, used, a.address, send, fee, vb, rate, change, change_addr,
+                      untouched=[c for c in res.coins if c not in used])
         del tx
     finally:
         if res is not None:
@@ -607,6 +675,9 @@ def main():
     p.add_argument("--fee-rate", type=int, help="sat/vB (default: rate saved by fetch)")
     p.add_argument("--max-index", type=int, default=2000,
                    help="how far to search each chain for addresses without a saved path (default 2000)")
+    p.add_argument("--test", action="store_true",
+                   help=f"TEST MODE: send only {TEST_AMOUNT_BTC} BTC, change goes back to the old address")
+    p.add_argument("--amount", metavar="BTC", help="send only this much (e.g. 0.005) instead of everything")
 
     p = sub.add_parser("sweep", help="build and sign a sweep; prints raw hex, never broadcasts")
     p.add_argument("address", help="your NEW wallet's receive address")
@@ -614,6 +685,9 @@ def main():
     p.add_argument("--addr", nargs="+", metavar="OLD_ADDRESS",
                    help="sweep only these known address(es) instead of scanning the whole seed")
     p.add_argument("--max-index", type=int, default=2000, help="search depth for --addr (default 2000)")
+    p.add_argument("--test", action="store_true",
+                   help=f"TEST MODE: send only {TEST_AMOUNT_BTC} BTC, change goes back to the old address")
+    p.add_argument("--amount", metavar="BTC", help="send only this much (e.g. 0.005) instead of everything")
 
     a = ap.parse_args()
     {"addresses": cmd_addresses, "fetch": cmd_fetch, "sign": cmd_sign,
