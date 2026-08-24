@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 
 import requests
 from bip_utils import (
-    Bip39MnemonicValidator, Bip39SeedGenerator, Bip39Languages,
+    Bip39MnemonicValidator, Bip39SeedGenerator,
     Bip44, Bip49, Bip84, Bip44Coins, Bip49Coins, Bip84Coins, Bip44Changes,
     ElectrumV2MnemonicValidator, ElectrumV2SeedGenerator, ElectrumV2Standard, ElectrumV2Segwit,
     ElectrumV1MnemonicValidator, ElectrumV1SeedGenerator, ElectrumV1,
@@ -38,7 +38,6 @@ from bitcoinutils.setup import setup as btc_setup
 from bitcoinutils.keys import PrivateKey, P2wpkhAddress, P2shAddress, P2pkhAddress
 from bitcoinutils.transactions import Transaction, TxInput, TxOutput, TxWitnessInput
 from bitcoinutils.script import Script
-from bitcoinutils.utils import to_satoshis
 
 APIS = ["https://mempool.space/api", "https://blockstream.info/api"]
 API = APIS[0]
@@ -170,13 +169,26 @@ def list_addresses(mnemonic, passphrase, per_chain):
             out.append({"address": addr, "kind": kind, "path": path})
     return out
 
+def dedupe_utxos(utxos):
+    """Drop duplicate (txid, vout) entries — a duplicate input makes the tx invalid."""
+    seen, out = set(), []
+    for u in utxos:
+        key = (u["txid"], u["vout"])
+        if key not in seen:
+            seen.add(key)
+            out.append(u)
+    return out
+
 def keys_for(mnemonic, passphrase, wanted):
     """Return {address: (kind, path, priv)} for the addresses in `wanted`, deriving
     only as far as needed. Any address the seed can't produce is reported."""
     wanted = set(wanted)
     found = {}
     limit = 2000
-    for label, chain in wallet_candidates(mnemonic, passphrase):
+    schemes = list(wallet_candidates(mnemonic, passphrase))
+    if not schemes:
+        sys.exit("Seed phrase is not a valid BIP39 or Electrum mnemonic. Check spelling/word order.")
+    for label, chain in schemes:
         for _ in range(limit):
             if not wanted - set(found):
                 break
@@ -198,7 +210,8 @@ def fetch_utxos(addresses):
         addr = a["address"] if isinstance(a, dict) else a
         time.sleep(0.15)
         for u in get_utxos(addr):
-            coins.append({"txid": u["txid"], "vout": u["vout"], "value": u["value"], "address": addr})
+            coins.append({"txid": u["txid"], "vout": u["vout"], "value": u["value"], "address": addr,
+                          "confirmed": bool(u.get("status", {}).get("confirmed", True))})
         if (i + 1) % 50 == 0:
             print(f"  {i+1}/{len(addresses)} checked ...")
     return coins
@@ -234,7 +247,6 @@ def scan(mnemonic, passphrase):
 # ----------------------------------------------------------------------------- transaction
 
 def build_and_sign(coins, dest, rate):
-    n_in = len(coins)
     # conservative vbytes estimate: overhead 11 + outputs 43 + inputs (p2pkh 148, p2sh-p2wpkh 91, p2wpkh 68)
     vb = 11 + 43 + sum({"p2pkh": 148, "p2sh-p2wpkh": 91, "p2wpkh": 68}[c.kind] for c in coins)
     fee = vb * rate
@@ -262,18 +274,24 @@ def build_and_sign(coins, dest, rate):
             if c.kind == "p2sh-p2wpkh":
                 ins[i].script_sig = Script([pub.get_segwit_address().to_script_pub_key().to_hex()])
             tx.witnesses.append(TxWitnessInput([sig, pub.to_hex()]))
-        wipe(c.priv)                # this key has done its one job
         del pk
+    # Several coins may share one key buffer (same address), so wipe only once
+    # every input is signed.
+    for c in coins:
+        wipe(c.priv)
     gc.collect()
     return tx, send, fee, vb
 
 def _dest_script(addr):
-    if addr.startswith("bc1q"):
-        return P2wpkhAddress(addr).to_script_pub_key()
-    if addr.startswith("3"):
-        return P2shAddress(addr).to_script_pub_key()
-    if addr.startswith("1"):
-        return P2pkhAddress(addr).to_script_pub_key()
+    try:
+        if addr.startswith("bc1q"):
+            return P2wpkhAddress(addr).to_script_pub_key()
+        if addr.startswith("3"):
+            return P2shAddress(addr).to_script_pub_key()
+        if addr.startswith("1"):
+            return P2pkhAddress(addr).to_script_pub_key()
+    except ValueError:
+        sys.exit(f"Destination address {addr!r} is malformed (bad checksum or typo). Aborting.")
     sys.exit("Destination must be a mainnet 1..., 3..., or bc1q... address (taproot bc1p not supported).")
 
 # ----------------------------------------------------------------------------- cli
@@ -284,12 +302,6 @@ def read_secret():
     p = getpass.getpass("BIP39 passphrase (leave empty if you never set one): ")
     return m, p
 
-
-def forget(*names, scope):
-    """Drop references and force collection so secrets are freed promptly."""
-    for n in names:
-        scope.pop(n, None)
-    gc.collect()
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -314,25 +326,32 @@ def main():
     if a.cmd == "addresses":
         mnemonic, passphrase = read_secret()
         addrs = list_addresses(mnemonic, passphrase, a.per_chain)
-        forget("mnemonic", "passphrase", scope=locals())
-        json.dump(addrs, open(a.out, "w"), indent=1)
+        del mnemonic, passphrase
+        gc.collect()
+        with open(a.out, "w") as fh:
+            json.dump(addrs, fh, indent=1)
         print(f"Wrote {len(addrs)} public addresses to {a.out} (no keys). Take this file online.")
         return
 
     if a.cmd == "fetch":
         addrs = [{"address": x} for x in (a.addr or [])]
         if a.addresses_file:
-            addrs += json.load(open(a.addresses_file))
+            with open(a.addresses_file) as fh:
+                addrs += json.load(fh)
+        addrs = list({x["address"]: x for x in addrs}.values())   # dedupe
         if not addrs:
             sys.exit("Give addresses.json or --addr ...")
         print(f"Fetching UTXOs for {len(addrs)} addresses (read-only) ...")
         coins = fetch_utxos(addrs)
         rate = fee_rate()
-        json.dump({"fee_rate": rate, "utxos": coins}, open(a.out, "w"), indent=1)
+        with open(a.out, "w") as fh:
+            json.dump({"fee_rate": rate, "utxos": coins}, fh, indent=1)
         total = sum(c["value"] for c in coins)
         print(f"Found {len(coins)} coin(s), total {total/1e8:.8f} BTC. Fee rate now {rate} sat/vB.")
         for c in coins:
-            print(f"  {c['value']/1e8:.8f}  {c['address']}")
+            print(f"  {c['value']/1e8:.8f}  {c['address']}" + ("" if c["confirmed"] else "  (UNCONFIRMED)"))
+        if any(not c["confirmed"] for c in coins):
+            print("Note: unconfirmed coins are included; wait for confirmation if you want to be safe.")
         print(f"Wrote {a.out}. Take this file to the offline machine.")
         return
 
@@ -340,21 +359,23 @@ def main():
         _dest_script(a.address)
         if input("Confirm destination address again (type it): ").strip() != a.address:
             sys.exit("Addresses do not match. Aborting.")
-        data = json.load(open(a.utxos_file))
+        with open(a.utxos_file) as fh:
+            data = json.load(fh)
         if not data["utxos"]:
             sys.exit("No UTXOs in file.")
         mnemonic, passphrase = read_secret()
-        keys = keys_for(mnemonic, passphrase, {u["address"] for u in data["utxos"]})
-        forget("mnemonic", "passphrase", scope=locals())
+        utxos = dedupe_utxos(data["utxos"])
+        keys = keys_for(mnemonic, passphrase, {u["address"] for u in utxos})
+        del mnemonic, passphrase
+        gc.collect()
         coins = [Coin(u["txid"], u["vout"], u["value"], u["address"],
                       keys[u["address"]][0], keys[u["address"]][2], keys[u["address"]][1])
-                 for u in data["utxos"]]
+                 for u in utxos]
         rate = a.fee_rate or data.get("fee_rate") or 10
         tx, send, fee, vb = build_and_sign(coins, a.address, rate)
         _print_result(tx, coins, a.address, send, fee, vb, rate)
-        for c in coins:
-            wipe(c.priv)
-        forget("coins", "keys", "tx", scope=locals())
+        del coins, keys, tx
+        gc.collect()
         return
 
     if a.cmd == "sweep":
@@ -366,7 +387,8 @@ def main():
     mnemonic, passphrase = read_secret()
     print("\nScanning (read-only) ...")
     res = scan(mnemonic, passphrase)
-    forget("mnemonic", "passphrase", scope=locals())   # words no longer needed
+    del mnemonic, passphrase        # words no longer needed
+    gc.collect()
     print(f"\nChecked {res.checked} addresses. Found {len(res.coins)} coin(s), total {res.total/1e8:.8f} BTC")
     for c in res.coins:
         print(f"  {c.value/1e8:.8f}  {c.address}  ({c.path})")
@@ -376,9 +398,8 @@ def main():
     rate = a.fee_rate or fee_rate()
     tx, send, fee, vb = build_and_sign(res.coins, a.address, rate)
     _print_result(tx, res.coins, a.address, send, fee, vb, rate)
-    for c in res.coins:
-        wipe(c.priv)
-    forget("res", "tx", scope=locals())
+    del res, tx
+    gc.collect()
 
 def _print_result(tx, coins, dest, send, fee, vb, rate):
     total = sum(c.value for c in coins)
