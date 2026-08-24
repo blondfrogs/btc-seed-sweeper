@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+# never commit anything that could hold a seed or signed tx
+*.txt
+*.log
+*.hex
