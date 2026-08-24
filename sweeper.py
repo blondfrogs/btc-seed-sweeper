@@ -3,13 +3,13 @@
 sweeper.py — recover BTC from an old seed phrase and sweep it to a new address.
 
 Everything sensitive (seed -> keys -> signing) happens locally in this process.
-The only network calls are read-only balance/UTXO lookups and the final
-broadcast of the already-signed transaction (and only after you type YES).
+The only network calls are read-only balance/UTXO/fee lookups. This tool
+NEVER broadcasts. It prints the raw signed transaction hex; you submit it
+yourself (e.g. https://mempool.space/tx/push) when you are ready.
 
 Usage:
-    python sweeper.py scan                 # find funds, no network writes
-    python sweeper.py sweep <new_address>  # build + sign, show summary, ask, broadcast
-    python sweeper.py sweep <new_address> --dry-run   # everything except broadcast
+    python sweeper.py scan                 # find funds
+    python sweeper.py sweep <new_address>  # build + sign, print raw tx hex
 """
 import argparse
 import getpass
@@ -88,11 +88,6 @@ def fee_rate():
         return requests.get(f"{API}/v1/fees/recommended", timeout=15).json()["halfHourFee"]
     except Exception:
         return 10
-
-def broadcast(raw_hex):
-    r = requests.post(f"{API}/tx", data=raw_hex, timeout=30)
-    r.raise_for_status()
-    return r.text.strip()
 
 # ----------------------------------------------------------------------------- derivation
 
@@ -221,9 +216,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("scan", help="find funds only")
-    s = sub.add_parser("sweep", help="build, sign and broadcast a sweep")
+    s = sub.add_parser("sweep", help="build and sign a sweep; prints raw hex, never broadcasts")
     s.add_argument("address", help="your NEW wallet's receive address")
-    s.add_argument("--dry-run", action="store_true", help="do everything except broadcast")
     s.add_argument("--fee-rate", type=int, help="sat/vB (default: current half-hour rate)")
     a = ap.parse_args()
 
@@ -251,15 +245,10 @@ def main():
     print(f"  amount : {send/1e8:.8f} BTC")
     print(f"  fee    : {fee} sats  ({rate} sat/vB, ~{vb} vB)")
     print(f"  txid   : {tx.get_txid()}")
-    print(f"\nRaw signed tx (you can broadcast this yourself anywhere):\n{raw}\n")
-    if a.dry_run:
-        print("--dry-run: not broadcasting.")
-        return
-    if input("Type YES to broadcast: ").strip() != "YES":
-        print("Not broadcast.")
-        return
-    txid = broadcast(raw)
-    print(f"Broadcast OK. Track it: https://mempool.space/tx/{txid}")
+    print("\nRaw signed transaction hex (NOT broadcast — this tool never submits):")
+    print(raw)
+    print("\nWhen ready, paste it at https://mempool.space/tx/push (or any node/explorer).")
+    print(f"Then track it: https://mempool.space/tx/{tx.get_txid()}")
 
 if __name__ == "__main__":
     main()
