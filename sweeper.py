@@ -20,12 +20,16 @@ One-machine usage:
     python sweeper.py scan                 # find funds
     python sweeper.py sweep <new_address>  # scan whole seed, sign, print raw tx hex
     python sweeper.py sweep <new_address> --addr <old_address>   # sweep one known address
+
+Unusual wallet?  --path "m/0'/7'" --kind p2pkh   adds a custom derivation base path.
 """
 import argparse
 import ctypes
 import gc
 import getpass
 import json
+import os
+import re
 import sys
 import time
 import unicodedata
@@ -33,23 +37,23 @@ from dataclasses import dataclass, field
 
 import requests
 from bip_utils import (
-    Bip39MnemonicValidator, Bip39SeedGenerator,
-    Bip44, Bip49, Bip84, Bip44Coins, Bip49Coins, Bip84Coins, Bip44Changes,
+    Bip39MnemonicValidator, Bip39SeedGenerator, Bip32Slip10Secp256k1,
+    P2PKHAddrEncoder, P2SHAddrEncoder, P2WPKHAddrEncoder, P2TRAddrEncoder, CoinsConf,
     ElectrumV2MnemonicValidator, ElectrumV2MnemonicTypes, ElectrumV2SeedGenerator,
     ElectrumV2Standard, ElectrumV2Segwit,
     ElectrumV1MnemonicValidator, ElectrumV1SeedGenerator, ElectrumV1,
 )
 from bitcoinutils.setup import setup as btc_setup
-from bitcoinutils.keys import PrivateKey, P2wpkhAddress, P2shAddress, P2pkhAddress
+from bitcoinutils.keys import PrivateKey, P2wpkhAddress, P2shAddress, P2pkhAddress, P2trAddress
 from bitcoinutils.transactions import Transaction, TxInput, TxOutput, TxWitnessInput
 from bitcoinutils.script import Script
 
-import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import verify_tx   # independent, spec-based signature verifier (same directory)  # noqa: E402
 
 APIS = ["https://mempool.space/api", "https://blockstream.info/api"]
 GAP_LIMIT = 20          # unused addresses in a row before we stop scanning a chain
+MAX_ACCOUNTS = 10       # account discovery stops at the first unused account, or here
 DUST = 546              # sats
 btc_setup("mainnet")
 
@@ -69,23 +73,59 @@ def wipe(buf):
 
 # ----------------------------------------------------------------------------- schemes
 
-# scheme id -> (label, input kind, pubkey compressed?)
+KINDS = ("p2pkh", "p2sh-p2wpkh", "p2wpkh", "p2tr")
+
+# Built-in derivation schemes. `base` is the path to the account node; "{a}" is the
+# account number. Address chain (0 receive / 1 change) and index are appended.
+# Electrum schemes have no BIP32 base path; they use bip_utils' Electrum classes.
 SCHEMES = {
-    "bip44":  ("BIP44 legacy m/44'/0'/0'",  "p2pkh",       True),
-    "bip49":  ("BIP49 segwit m/49'/0'/0'",  "p2sh-p2wpkh", True),
-    "bip84":  ("BIP84 native m/84'/0'/0'",  "p2wpkh",      True),
-    "el2std": ("Electrum v2 standard",      "p2pkh",       True),
-    "el2sw":  ("Electrum v2 segwit",        "p2wpkh",      True),
-    "el1":    ("Electrum v1 (pre-2014)",    "p2pkh",       False),   # uncompressed keys
+    "bip44":  dict(label="BIP44 legacy m/44'/0'/{a}'",     kind="p2pkh",       base="m/44'/0'/{a}'",
+                   wallets="Coinomi, Mycelium, Exodus, Jaxx, Ledger/Trezor legacy, blockchain.com, Copay"),
+    "bip49":  dict(label="BIP49 segwit m/49'/0'/{a}'",     kind="p2sh-p2wpkh", base="m/49'/0'/{a}'",
+                   wallets="Coinomi, Mycelium, Ledger/Trezor, Samourai"),
+    "bip84":  dict(label="BIP84 native m/84'/0'/{a}'",     kind="p2wpkh",      base="m/84'/0'/{a}'",
+                   wallets="Coinomi, BlueWallet, Wasabi, Sparrow, Ledger/Trezor, Bitcoin Core"),
+    "bip86":  dict(label="BIP86 taproot m/86'/0'/{a}'",    kind="p2tr",        base="m/86'/0'/{a}'",
+                   wallets="Bitcoin Core, Sparrow, Ledger/Trezor (2021+)"),
+    "bip32h": dict(label="BIP32 m/{a}'",                   kind="p2pkh",       base="m/{a}'",
+                   wallets="MultiBit HD, Bread/BRD (legacy), Hive, Bitcoin Core pre-0.13 style"),
+    "el2std": dict(label="Electrum v2 standard",           kind="p2pkh",       base=None),
+    "el2sw":  dict(label="Electrum v2 segwit",             kind="p2wpkh",      base=None),
+    "el1":    dict(label="Electrum v1 (pre-2014)",         kind="p2pkh",       base=None, uncompressed=True),
 }
-BIP_CLASSES = {"bip44": (Bip44, Bip44Coins.BITCOIN),
-               "bip49": (Bip49, Bip49Coins.BITCOIN),
-               "bip84": (Bip84, Bip84Coins.BITCOIN)}
-INPUT_VBYTES = {"p2pkh": 148, "p2pkh-uncompressed": 180, "p2sh-p2wpkh": 91, "p2wpkh": 68}
+KIND_BY_PURPOSE = {"44": "p2pkh", "49": "p2sh-p2wpkh", "84": "p2wpkh", "86": "p2tr"}
+INPUT_VBYTES = {"p2pkh": 148, "p2pkh-uncompressed": 180, "p2sh-p2wpkh": 91, "p2wpkh": 68, "p2tr": 58}
+_P2PKH_VER = CoinsConf.BitcoinMainNet.ParamByKey("p2pkh_net_ver")
+_P2SH_VER = CoinsConf.BitcoinMainNet.ParamByKey("p2sh_net_ver")
+
+_PATH_RE = re.compile(r"^m(/\d+'?)*$")
 
 
-def path_str(scheme, chain, index):
-    return f"{SCHEMES[scheme][0]}/{chain}/{index}"
+def custom_scheme_id(path, kind):
+    path = path.strip().replace("h", "'").replace("H", "'")
+    if not _PATH_RE.match(path):
+        sys.exit(f"Bad derivation path {path!r}. Example: m/0'/7' or m/44'/0'/3'")
+    if kind is None:
+        purpose = path.split("/")[1].rstrip("'") if "/" in path else ""
+        kind = KIND_BY_PURPOSE.get(purpose, "p2pkh")
+    if kind not in KINDS:
+        sys.exit(f"--kind must be one of {KINDS}")
+    return f"custom:{path}:{kind}"
+
+
+def scheme_info(scheme):
+    """-> dict(label, kind, base, uncompressed, has_accounts) for builtin or custom ids."""
+    if scheme.startswith("custom:"):
+        _, path, kind = scheme.split(":", 2)
+        return dict(label=f"custom {path}", kind=kind, base=path, uncompressed=False, has_accounts=False)
+    d = SCHEMES[scheme]
+    return dict(label=d["label"], kind=d["kind"], base=d["base"],
+                uncompressed=d.get("uncompressed", False), has_accounts=d["base"] is not None)
+
+
+def path_str(scheme, account, chain, index):
+    info = scheme_info(scheme)
+    return f"{info['label'].replace('{a}', str(account))}/{chain}/{index}"
 
 
 def electrum_normalize(text):
@@ -103,7 +143,7 @@ class Coin:
     vout: int
     value: int            # sats
     address: str
-    kind: str             # p2pkh | p2sh-p2wpkh | p2wpkh
+    kind: str             # p2pkh | p2sh-p2wpkh | p2wpkh | p2tr
     priv: bytearray       # raw 32-byte private key; zeroed after signing
     path: str
     compressed: bool = True
@@ -187,11 +227,11 @@ def _electrum_v2_type(mnemonic):
     return None
 
 
-def seed_schemes(mnemonic):
+def seed_schemes(mnemonic, custom=()):
     """Which scheme ids could this mnemonic belong to?"""
     out = []
     if Bip39MnemonicValidator().IsValid(mnemonic):
-        out += ["bip44", "bip49", "bip84"]
+        out += ["bip44", "bip49", "bip84", "bip86", "bip32h"] + list(custom)
     t = _electrum_v2_type(mnemonic)
     if t == ElectrumV2MnemonicTypes.STANDARD:
         out.append("el2std")
@@ -199,117 +239,149 @@ def seed_schemes(mnemonic):
         out.append("el2sw")
     if ElectrumV1MnemonicValidator().IsValid(mnemonic):
         out.append("el1")
+    if not out:
+        sys.exit("Seed phrase is not a valid BIP39 or Electrum mnemonic. Check spelling/word order.")
     return out
 
 
-def _roots(mnemonic, passphrase, schemes, public_only):
-    """Per-scheme root objects. For BIP schemes with public_only, the root is the
-    account xpub — no private key is ever derived on the public-only path."""
-    roots = {}
-    bip = [s for s in schemes if s in BIP_CLASSES]
-    if bip:
-        seed = Bip39SeedGenerator(mnemonic).Generate(passphrase)
-        for s in bip:
-            cls, coin = BIP_CLASSES[s]
-            acct = cls.FromSeed(seed, coin).Purpose().Coin().Account(0)
-            if public_only:
-                acct = cls.FromExtendedKey(acct.PublicKey().ToExtended(), coin)
-            roots[s] = acct
-        del seed
-    if "el2std" in schemes or "el2sw" in schemes:
-        seed = ElectrumV2SeedGenerator(mnemonic).Generate(electrum_normalize(passphrase))
-        if "el2std" in schemes:
-            roots["el2std"] = ElectrumV2Standard.FromSeed(seed)
-        if "el2sw" in schemes:
-            roots["el2sw"] = ElectrumV2Segwit.FromSeed(seed)
-        del seed
-    if "el1" in schemes:
-        roots["el1"] = ElectrumV1.FromSeed(ElectrumV1SeedGenerator(mnemonic).Generate())
-    return roots
+class Roots:
+    """Lazily derives per-(scheme, account) nodes. Holds the master key for the BIP39
+    seed while alive; call .close() to drop it."""
+
+    def __init__(self, mnemonic, passphrase, schemes, public_only=False):
+        self.public_only = public_only
+        self.master = None
+        self.nodes = {}
+        if any(scheme_info(s)["base"] is not None for s in schemes):
+            seed = Bip39SeedGenerator(mnemonic).Generate(passphrase)
+            self.master = Bip32Slip10Secp256k1.FromSeed(seed)
+            del seed
+        if "el2std" in schemes or "el2sw" in schemes:
+            seed = ElectrumV2SeedGenerator(mnemonic).Generate(electrum_normalize(passphrase))
+            if "el2std" in schemes:
+                self.nodes[("el2std", 0)] = ElectrumV2Standard.FromSeed(seed)
+            if "el2sw" in schemes:
+                self.nodes[("el2sw", 0)] = ElectrumV2Segwit.FromSeed(seed)
+            del seed
+        if "el1" in schemes:
+            self.nodes[("el1", 0)] = ElectrumV1.FromSeed(ElectrumV1SeedGenerator(mnemonic).Generate())
+
+    def node(self, scheme, account=0):
+        info = scheme_info(scheme)
+        if info["base"] is None:
+            account = 0
+        key = (scheme, account)
+        if key not in self.nodes:
+            if self.master is None:
+                raise KeyError(scheme)
+            n = self.master.DerivePath(info["base"].replace("{a}", str(account)))
+            if self.public_only:
+                n.ConvertToPublic()      # from here on, no private keys exist for this account
+            self.nodes[key] = n
+        return self.nodes[key]
+
+    def derive(self, scheme, account, chain, index):
+        """-> (address, priv bytearray or None)"""
+        info = scheme_info(scheme)
+        node = self.node(scheme, account)
+        if info["base"] is None:                       # Electrum
+            addr = node.GetAddress(chain, index)
+            priv = None if self.public_only else bytearray(node.GetPrivateKey(chain, index).Raw().ToBytes())
+            return addr, priv
+        k = node.ChildKey(chain).ChildKey(index)
+        pub = k.PublicKey().KeyObject()
+        kind = info["kind"]
+        if kind == "p2pkh":
+            addr = P2PKHAddrEncoder.EncodeKey(pub, net_ver=_P2PKH_VER)
+        elif kind == "p2sh-p2wpkh":
+            addr = P2SHAddrEncoder.EncodeKey(pub, net_ver=_P2SH_VER)
+        elif kind == "p2wpkh":
+            addr = P2WPKHAddrEncoder.EncodeKey(pub, hrp="bc")
+        else:
+            addr = P2TRAddrEncoder.EncodeKey(pub, hrp="bc")
+        priv = None if self.public_only else bytearray(k.PrivateKey().Raw().ToBytes())
+        return addr, priv
+
+    def close(self):
+        self.master = None
+        self.nodes.clear()
+        gc.collect()
 
 
-def _derive(root, scheme, chain, index, public_only):
-    """-> (address, priv bytearray or None)"""
-    if scheme in BIP_CLASSES:
-        k = root.Change(Bip44Changes.CHAIN_INT if chain else Bip44Changes.CHAIN_EXT).AddressIndex(index)
-        addr = k.PublicKey().ToAddress()
-        priv = None if public_only else bytearray(k.PrivateKey().Raw().ToBytes())
-    else:
-        addr = root.GetAddress(chain, index)
-        priv = None if public_only else bytearray(root.GetPrivateKey(chain, index).Raw().ToBytes())
-    return addr, priv
+def make_coin(u, addr, scheme, account, chain, index, priv):
+    info = scheme_info(scheme)
+    return Coin(u["txid"], u["vout"], u["value"], addr, info["kind"], priv,
+                path_str(scheme, account, chain, index), not info["uncompressed"])
 
 
-def wallet_chains(mnemonic, passphrase, public_only=False):
-    """Yield (scheme, chain, generator) for every chain this seed could have used.
-    Generator yields (address, priv|None, kind, path, compressed) forever."""
-    schemes = seed_schemes(mnemonic)
-    if not schemes:
-        sys.exit("Seed phrase is not a valid BIP39 or Electrum mnemonic. Check spelling/word order.")
-    roots = _roots(mnemonic, passphrase, schemes, public_only)
-    for scheme in schemes:
-        label, kind, compressed = SCHEMES[scheme]
-        for chain in (0, 1):
-            def gen(root=roots[scheme], scheme=scheme, chain=chain, kind=kind, compressed=compressed):
-                i = 0
-                while True:
-                    addr, priv = _derive(root, scheme, chain, i, public_only)
-                    yield addr, priv, kind, path_str(scheme, chain, i), compressed
-                    i += 1
-            yield scheme, chain, gen()
-
-
-def list_addresses(mnemonic, passphrase, per_chain):
-    """Public info only, derived from xpubs where possible (no private keys created)."""
+def list_addresses(mnemonic, passphrase, per_chain, accounts=1, custom=()):
+    """Public info only, derived from account xpubs (no private keys created)."""
+    schemes = seed_schemes(mnemonic, custom)
+    roots = Roots(mnemonic, passphrase, schemes, public_only=True)
     out = []
-    for scheme, chain, g in wallet_chains(mnemonic, passphrase, public_only=True):
-        for i in range(per_chain):
-            addr, _, kind, path, _ = next(g)
-            out.append({"address": addr, "kind": kind, "scheme": scheme, "chain": chain,
-                        "index": i, "path": path})
+    for scheme in schemes:
+        n_acc = accounts if scheme_info(scheme)["has_accounts"] else 1
+        for account in range(n_acc):
+            for chain in (0, 1):
+                for i in range(per_chain):
+                    addr, _ = roots.derive(scheme, account, chain, i)
+                    out.append({"address": addr, "kind": scheme_info(scheme)["kind"], "scheme": scheme,
+                                "account": account, "chain": chain, "index": i,
+                                "path": path_str(scheme, account, chain, i)})
+    roots.close()
     return out
 
 
-def keys_for(mnemonic, passphrase, wanted, max_index=2000):
-    """wanted: {address: {scheme, chain, index} or None}.
-    Returns {address: (kind, path, priv, compressed)}. Entries with a known
-    scheme/chain/index are derived directly; the rest are searched up to max_index."""
-    schemes = seed_schemes(mnemonic)
-    if not schemes:
-        sys.exit("Seed phrase is not a valid BIP39 or Electrum mnemonic. Check spelling/word order.")
-    roots = _roots(mnemonic, passphrase, schemes, public_only=False)
+def keys_for(mnemonic, passphrase, wanted, max_index=2000, accounts=1, custom=()):
+    """wanted: {address: {scheme, account, chain, index} or None}.
+    Returns {address: (kind, path, priv, compressed)}. Entries with a known location are
+    derived directly; the rest are searched (all schemes, `accounts` accounts, max_index)."""
+    schemes = seed_schemes(mnemonic, custom)
+    roots = Roots(mnemonic, passphrase, schemes)
     found = {}
+
+    def record(addr, scheme, account, chain, index, priv):
+        info = scheme_info(scheme)
+        found[addr] = (info["kind"], path_str(scheme, account, chain, index), priv, not info["uncompressed"])
 
     # 1. exact derivations
     for addr, loc in wanted.items():
-        if loc and loc.get("scheme") in roots:
-            s = loc["scheme"]
-            got, priv = _derive(roots[s], s, int(loc["chain"]), int(loc["index"]), False)
-            if got == addr:
-                label, kind, compressed = SCHEMES[s]
-                found[addr] = (kind, path_str(s, loc["chain"], loc["index"]), priv, compressed)
-            else:
-                wipe(priv)
+        if not loc:
+            continue
+        s = loc.get("scheme")
+        if s not in schemes and not (s or "").startswith("custom:"):
+            continue
+        try:
+            acc, ch, ix = int(loc.get("account", 0)), int(loc["chain"]), int(loc["index"])
+            got, priv = roots.derive(s, acc, ch, ix)
+        except Exception:
+            continue
+        if got == addr:
+            record(addr, s, acc, ch, ix, priv)
+        else:
+            wipe(priv)
 
     # 2. search for the rest
     remaining = set(wanted) - set(found)
     if remaining:
         for scheme in schemes:
-            label, kind, compressed = SCHEMES[scheme]
-            for chain in (0, 1):
-                for i in range(max_index):
-                    if not remaining:
-                        break
-                    addr, priv = _derive(roots[scheme], scheme, chain, i, False)
-                    if addr in remaining:
-                        found[addr] = (kind, path_str(scheme, chain, i), priv, compressed)
-                        remaining.discard(addr)
-                    else:
-                        wipe(priv)
+            n_acc = accounts if scheme_info(scheme)["has_accounts"] else 1
+            for account in range(n_acc):
+                for chain in (0, 1):
+                    for i in range(max_index):
+                        if not remaining:
+                            break
+                        addr, priv = roots.derive(scheme, account, chain, i)
+                        if addr in remaining:
+                            record(addr, scheme, account, chain, i, priv)
+                            remaining.discard(addr)
+                        else:
+                            wipe(priv)
+    roots.close()
     if remaining:
         sys.exit("This seed does not control these addresses (wrong seed/passphrase, "
-                 f"non-standard path, or index beyond {max_index} — try --max-index):\n  "
-                 + "\n  ".join(sorted(remaining)))
+                 f"non-standard path, account beyond {accounts - 1}, or index beyond {max_index}"
+                 " — see --path, --accounts, --max-index):\n  " + "\n  ".join(sorted(remaining)))
     return found
 
 
@@ -324,7 +396,7 @@ def normalize_addr_entries(entries):
 
 
 def fetch_utxos(entries):
-    """Online, no secrets. Carries scheme/chain/index through so `sign` needn't search."""
+    """Online, no secrets. Carries scheme/account/chain/index through so `sign` needn't search."""
     coins = []
     for i, e in enumerate(entries):
         addr = e["address"]
@@ -332,7 +404,7 @@ def fetch_utxos(entries):
         for u in get_utxos(addr):
             c = {"txid": u["txid"], "vout": u["vout"], "value": u["value"], "address": addr,
                  "confirmed": bool(u.get("status", {}).get("confirmed", True))}
-            for k in ("scheme", "chain", "index"):
+            for k in ("scheme", "account", "chain", "index"):
                 if k in e:
                     c[k] = e[k]
             coins.append(c)
@@ -358,28 +430,41 @@ def coins_from_utxos(utxos, keys):
                  keys[u["address"]][3]) for u in utxos]
 
 
-def scan(mnemonic, passphrase):
+def scan(mnemonic, passphrase, max_accounts=MAX_ACCOUNTS, custom=()):
+    """Walk every scheme with gap-limit address discovery and BIP44-style account
+    discovery (stop at the first account with no used address)."""
     res = ScanResult()
-    for scheme, chain, g in wallet_chains(mnemonic, passphrase):
-        print(f"  scanning {SCHEMES[scheme][0]} chain {chain} ...", end="", flush=True)
-        gap, found = 0, 0
-        for addr, priv, kind, path, compressed in g:
-            res.checked += 1
-            time.sleep(0.15)   # be polite to the public API
-            if not address_used(addr):
-                wipe(priv)          # unused address: forget its key immediately
-                gap += 1
-                if gap >= GAP_LIMIT:
-                    break
-                continue
-            gap = 0
-            utxos = get_utxos(addr)
-            if not utxos:
-                wipe(priv)
-            for u in utxos:
-                res.coins.append(Coin(u["txid"], u["vout"], u["value"], addr, kind, priv, path, compressed))
-                found += u["value"]
-        print(f" {found/1e8:.8f} BTC")
+    schemes = seed_schemes(mnemonic, custom)
+    roots = Roots(mnemonic, passphrase, schemes)
+    for scheme in schemes:
+        info = scheme_info(scheme)
+        n_acc = max_accounts if info["has_accounts"] else 1
+        for account in range(n_acc):
+            account_used = False
+            for chain in (0, 1):
+                label = info["label"].replace("{a}", str(account))
+                print(f"  scanning {label} chain {chain} ...", end="", flush=True)
+                gap, found, i = 0, 0, 0
+                while gap < GAP_LIMIT:
+                    addr, priv = roots.derive(scheme, account, chain, i)
+                    res.checked += 1
+                    time.sleep(0.15)   # be polite to the public API
+                    if not address_used(addr):
+                        wipe(priv)      # unused address: forget its key immediately
+                        gap += 1
+                    else:
+                        gap, account_used = 0, True
+                        utxos = get_utxos(addr)
+                        if not utxos:
+                            wipe(priv)
+                        for u in utxos:
+                            res.coins.append(make_coin(u, addr, scheme, account, chain, i, priv))
+                            found += u["value"]
+                    i += 1
+                print(f" {found/1e8:.8f} BTC")
+            if not account_used:
+                break               # BIP44 account discovery: stop at first unused account
+    roots.close()
     return res
 
 
@@ -435,6 +520,9 @@ def build_and_sign(coins, dest, rate, amount=None):
     ins = [TxInput(c.txid, c.vout) for c in coins]
     has_segwit = any(c.kind != "p2pkh" for c in coins)
     tx = Transaction(ins, outs, has_segwit=has_segwit)
+    # BIP341 (taproot) sighash commits to every input's scriptPubKey and amount.
+    all_spks = [_dest_script(c.address) for c in coins]
+    all_amounts = [c.value for c in coins]
 
     # Pass 1: compute every signature while ALL scriptSigs are still empty. The legacy
     # sighash must see other inputs' scriptSigs as empty, and the library does not clear
@@ -446,6 +534,9 @@ def build_and_sign(coins, dest, rate, amount=None):
         if c.kind == "p2pkh":
             spk = pub.get_address(compressed=c.compressed).to_script_pub_key()
             sigs.append((pk.sign_input(tx, i, spk), pub.to_hex(compressed=c.compressed), None))
+        elif c.kind == "p2tr":
+            sig = pk.sign_taproot_input(tx, i, all_spks, all_amounts)   # key path, tweaked
+            sigs.append((sig, None, None))
         else:
             # BIP143: the script code for P2WPKH is the P2PKH-form script of the key hash,
             # NOT the P2WPKH scriptPubKey itself.
@@ -459,6 +550,8 @@ def build_and_sign(coins, dest, rate, amount=None):
             ins[i].script_sig = Script([sig, pub_hex])
             if has_segwit:
                 tx.witnesses.append(TxWitnessInput([]))
+        elif c.kind == "p2tr":
+            tx.witnesses.append(TxWitnessInput([sig]))
         else:
             if c.kind == "p2sh-p2wpkh":
                 ins[i].script_sig = Script([redeem_hex])
@@ -487,13 +580,15 @@ def _dest_script(addr):
     try:
         if addr.startswith("bc1q"):
             return P2wpkhAddress(addr).to_script_pub_key()
+        if addr.startswith("bc1p"):
+            return P2trAddress(addr).to_script_pub_key()
         if addr.startswith("3"):
             return P2shAddress(addr).to_script_pub_key()
         if addr.startswith("1"):
             return P2pkhAddress(addr).to_script_pub_key()
     except ValueError:
-        sys.exit(f"Destination address {addr!r} is malformed (bad checksum or typo). Aborting.")
-    sys.exit("Destination must be a mainnet 1..., 3..., or bc1q... address (taproot bc1p not supported).")
+        sys.exit(f"Address {addr!r} is malformed (bad checksum or typo). Aborting.")
+    sys.exit("Address must be a mainnet 1..., 3..., bc1q... or bc1p... address.")
 
 
 # ----------------------------------------------------------------------------- cli
@@ -511,6 +606,11 @@ def _amount_from_args(a):
     if getattr(a, "test", False):
         return parse_amount(TEST_AMOUNT_BTC)
     return parse_amount(a.amount) if a.amount else None
+
+
+def _custom_from_args(a):
+    paths = getattr(a, "path", None) or []
+    return [custom_scheme_id(p, getattr(a, "kind", None)) for p in paths]
 
 
 def confirm_destination(addr):
@@ -541,8 +641,9 @@ def _print_result(tx, coins, dest, send, fee, vb, rate, change=0, change_addr=No
 
 
 def cmd_addresses(a):
+    custom = _custom_from_args(a)
     mnemonic, passphrase = read_secret()
-    addrs = list_addresses(mnemonic, passphrase, a.per_chain)
+    addrs = list_addresses(mnemonic, passphrase, a.per_chain, a.accounts, custom)
     del mnemonic, passphrase
     gc.collect()
     with open(a.out, "w") as fh:
@@ -585,12 +686,13 @@ def cmd_sign(a):
         sys.exit("No UTXOs in file.")
     rate = check_fee_rate(a.fee_rate if a.fee_rate is not None else data.get("fee_rate"))
     amount = _amount_from_args(a)      # validate before asking for anything secret
+    custom = _custom_from_args(a)
     wanted = {}
     for u in utxos:
-        loc = {k: u[k] for k in ("scheme", "chain", "index") if k in u}
-        wanted[u["address"]] = loc if len(loc) == 3 else wanted.get(u["address"])
+        loc = {k: u[k] for k in ("scheme", "account", "chain", "index") if k in u}
+        wanted[u["address"]] = loc if {"scheme", "chain", "index"} <= set(loc) else wanted.get(u["address"])
     mnemonic, passphrase = read_secret()
-    keys = keys_for(mnemonic, passphrase, wanted, a.max_index)
+    keys = keys_for(mnemonic, passphrase, wanted, a.max_index, a.accounts, custom)
     del mnemonic, passphrase
     gc.collect()
     coins = coins_from_utxos(utxos, keys)
@@ -609,6 +711,7 @@ def cmd_sign(a):
 
 def cmd_scan_or_sweep(a):
     amount = None
+    custom = _custom_from_args(a)
     if a.cmd == "sweep":
         confirm_destination(a.address)
         amount = _amount_from_args(a)  # validate before asking for anything secret
@@ -622,7 +725,8 @@ def cmd_scan_or_sweep(a):
             if not utxos:
                 sys.exit("No coins found on the given address(es).")
             mnemonic, passphrase = read_secret()
-            keys = keys_for(mnemonic, passphrase, {u["address"]: None for u in utxos}, a.max_index)
+            keys = keys_for(mnemonic, passphrase, {u["address"]: None for u in utxos},
+                            a.max_index, a.accounts, custom)
             del mnemonic, passphrase
             gc.collect()
             res = ScanResult(coins=coins_from_utxos(utxos, keys), checked=len(entries))
@@ -630,7 +734,7 @@ def cmd_scan_or_sweep(a):
         else:
             mnemonic, passphrase = read_secret()
             print("\nScanning (read-only) ...")
-            res = scan(mnemonic, passphrase)
+            res = scan(mnemonic, passphrase, a.accounts, custom)
             del mnemonic, passphrase        # words no longer needed
             gc.collect()
 
@@ -654,15 +758,26 @@ def cmd_scan_or_sweep(a):
         gc.collect()
 
 
+def _add_path_args(p):
+    p.add_argument("--path", action="append", metavar="M/…",
+                   help="extra custom derivation base path, e.g. \"m/0'/7'\" (repeatable)")
+    p.add_argument("--kind", choices=KINDS, help="address type for --path (default: by purpose, else p2pkh)")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("scan", help="find funds only (needs seed + network)")
+    p = sub.add_parser("scan", help="find funds only (needs seed + network)")
+    p.add_argument("--accounts", type=int, default=MAX_ACCOUNTS,
+                   help=f"max accounts to discover per scheme (default {MAX_ACCOUNTS}; stops at first unused)")
+    _add_path_args(p)
 
     p = sub.add_parser("addresses", help="OFFLINE: seed -> public address list")
     p.add_argument("-o", "--out", default="addresses.json")
     p.add_argument("-n", "--per-chain", type=int, default=100, help="addresses per chain (default 100)")
+    p.add_argument("--accounts", type=int, default=1, help="accounts per scheme to list (default 1 = account 0)")
+    _add_path_args(p)
 
     p = sub.add_parser("fetch", help="ONLINE, no seed: addresses -> utxos.json")
     p.add_argument("addresses_file", nargs="?", help="addresses.json from the offline step")
@@ -675,9 +790,11 @@ def main():
     p.add_argument("--fee-rate", type=int, help="sat/vB (default: rate saved by fetch)")
     p.add_argument("--max-index", type=int, default=2000,
                    help="how far to search each chain for addresses without a saved path (default 2000)")
+    p.add_argument("--accounts", type=int, default=1, help="accounts to search for unlocated addresses (default 1)")
     p.add_argument("--test", action="store_true",
                    help=f"TEST MODE: send only {TEST_AMOUNT_BTC} BTC, change goes back to the old address")
     p.add_argument("--amount", metavar="BTC", help="send only this much (e.g. 0.005) instead of everything")
+    _add_path_args(p)
 
     p = sub.add_parser("sweep", help="build and sign a sweep; prints raw hex, never broadcasts")
     p.add_argument("address", help="your NEW wallet's receive address")
@@ -685,9 +802,12 @@ def main():
     p.add_argument("--addr", nargs="+", metavar="OLD_ADDRESS",
                    help="sweep only these known address(es) instead of scanning the whole seed")
     p.add_argument("--max-index", type=int, default=2000, help="search depth for --addr (default 2000)")
+    p.add_argument("--accounts", type=int, default=MAX_ACCOUNTS,
+                   help=f"max accounts to discover / search (default {MAX_ACCOUNTS})")
     p.add_argument("--test", action="store_true",
                    help=f"TEST MODE: send only {TEST_AMOUNT_BTC} BTC, change goes back to the old address")
     p.add_argument("--amount", metavar="BTC", help="send only this much (e.g. 0.005) instead of everything")
+    _add_path_args(p)
 
     a = ap.parse_args()
     {"addresses": cmd_addresses, "fetch": cmd_fetch, "sign": cmd_sign,

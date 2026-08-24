@@ -277,29 +277,51 @@ gap limit), so it finds everything the wallet ever used. `sweep` still never bro
 
 ## Which wallets does it support?
 
-| Seed type | Scheme | Address style | Path scanned |
+Built-in derivation schemes (all scanned automatically; receive **and** change chains):
+
+| Scheme | Path | Address style | Wallets that used it |
 |---|---|---|---|
-| BIP39 (12/24 words) | BIP44 legacy | `1…` | `m/44'/0'/0'/{0,1}/i` |
-| BIP39 | BIP49 nested segwit | `3…` | `m/49'/0'/0'/{0,1}/i` |
-| BIP39 | BIP84 native segwit | `bc1q…` | `m/84'/0'/0'/{0,1}/i` |
-| Electrum v2 | standard | `1…` | Electrum's own |
-| Electrum v2 | segwit | `bc1q…` | Electrum's own |
-| Electrum v1 (pre-2014) | legacy, uncompressed keys | `1…` | Electrum's own |
+| BIP44 legacy | `m/44'/0'/a'/{0,1}/i` | `1…` | Coinomi, Mycelium, Exodus, Jaxx, blockchain.com, Copay/BitPay, Ledger & Trezor (legacy accounts), Coinbase Wallet |
+| BIP49 nested segwit | `m/49'/0'/a'/{0,1}/i` | `3…` | Coinomi, Mycelium, Samourai, Ledger & Trezor |
+| BIP84 native segwit | `m/84'/0'/a'/{0,1}/i` | `bc1q…` | Coinomi, BlueWallet, Wasabi, Sparrow, Trust Wallet, Bitcoin Core, Ledger & Trezor |
+| BIP86 taproot | `m/86'/0'/a'/{0,1}/i` | `bc1p…` | Bitcoin Core, Sparrow, Ledger & Trezor (2021+) |
+| BIP32 "account 0" | `m/a'/{0,1}/i` | `1…` | **MultiBit HD**, **Bread / BRD** (legacy), Hive, early bitcoinj wallets |
+| Electrum v2 standard | Electrum's own | `1…` | Electrum ≥ 2.0 |
+| Electrum v2 segwit | Electrum's own | `bc1q…` | Electrum ≥ 3.0 |
+| Electrum v1 | Electrum's own, uncompressed keys | `1…` | Electrum < 2.0 (pre-2014) |
 
-That covers Electrum, Ledger, Trezor, Mycelium (recent), Samourai, Wasabi, BlueWallet,
-Exodus, Coinomi, Trust Wallet, and most others. Receive **and** change chains are scanned.
-Electrum seeds are detected by type (standard vs segwit) so only the matching chains are
-walked, and Electrum passphrases are normalised the way Electrum does it (case, accents,
-spacing); BIP39 passphrases are used verbatim, as BIP39 requires.
+`a` is the **account number**. `scan`/`sweep` do BIP44-style account discovery: they walk
+account 0, 1, 2, … and stop at the first account with no history (max `--accounts`, default
+10). `addresses` lists account 0 only unless you pass `--accounts N`.
 
-Not covered (yet): accounts other than 0, Taproot (`m/86'`), and wallets with unusual paths
-(Multibit HD, early Bread/Mycelium, Bitcoin Core descriptor wallets, some Coinomi versions).
-These are one-line additions in `wallet_candidates()` — open an issue with the wallet name.
+**Coinomi** specifically: it is a plain BIP39 wallet — BIP44 in early versions, plus BIP49
+and BIP84 in later ones — all covered. Coinomi never uses a BIP39 passphrase unless you set
+one in "Advanced" when creating the wallet.
 
-**Bitcoin only.** The same seed may control other coins (LTC, ETH, BCH…) — this tool
-neither touches nor sees them; they stay where they are.
+**Bitcoin Core** note: Core has no seed *phrase* — it backs up `wallet.dat` files. If your
+old wallet is a `wallet.dat`, this tool can't read it (use `bitcoin-cli` / `dumpwallet`).
+Only Core wallets restored from a BIP39 phrase via a descriptor import apply here.
 
----
+### Anything else: `--path`
+
+If your wallet used some other path, pass it explicitly — it is added to every scan and
+search, and its id is carried through `addresses.json` → `utxos.json` so you don't need to
+repeat it at `sign` time:
+
+```bash
+python sweeper.py addresses --path "m/0'/7'"                # address type inferred (p2pkh)
+python sweeper.py addresses --path "m/44'/0'/12'"           # account 12 legacy
+python sweeper.py scan      --path "m/49'/0'/0'/2'" --kind p2sh-p2wpkh
+```
+
+`--path` is the *base* path; the tool appends `/{0,1}/i` for the receive/change chains.
+The address type is inferred from the purpose number (44→`1…`, 49→`3…`, 84→`bc1q…`,
+86→`bc1p…`) or set with `--kind`. `--path` can be repeated. If you tell us the wallet's
+name we can usually tell you its path — or add it to the built-in table.
+
+Not covered: multisig wallets (`m/48'`, Copay shared wallets), Samourai's BIP47 paths,
+Lightning channels, and non-Bitcoin coins. **Bitcoin only.** The same seed may also control
+LTC, BCH, ETH, etc. — this tool neither sees nor touches them.
 
 ## Troubleshooting
 
@@ -312,7 +334,10 @@ are lowercase and separated by single spaces; the tool normalises spacing for yo
 - Did you set a BIP39 passphrase back then? Try again with it — a different passphrase
   gives a completely different wallet.
 - Old wallet used more than 100 addresses? Re-run `addresses --per-chain 500`.
-- The wallet software may use a non-standard path — tell us which wallet it was.
+- More than one account? `scan` discovers accounts automatically; for `addresses` pass
+  `--accounts 5`.
+- The wallet software may use a non-standard path — see `--path` in
+  [Which wallets does it support?](#which-wallets-does-it-support), or tell us the wallet.
 - Check one of the generated addresses on a block explorer. If the address *has* history
   but the tool shows nothing, the coins were already spent.
 
@@ -362,8 +387,8 @@ What this tool does to protect you:
   the same seed controls.
 - **Destination is double-entered** and validated before the seed is requested.
 - **Every signature is independently verified before output.** `verify_tx.py` is a
-  separate, from-spec implementation of the legacy and BIP143 sighash algorithms (validated
-  against the official BIP143 test vector) using libsecp256k1. `sweeper.py` runs it on every
+  separate, from-spec implementation of the legacy, BIP143 (segwit) and BIP341 (taproot)
+  sighash algorithms (validated against the official BIP143 test vector) using libsecp256k1. `sweeper.py` runs it on every
   transaction it builds and refuses to print hex that doesn't pass — a signing bug can't
   reach you as a rejected broadcast. It also checks the fee estimate against the real size.
 - **Fee rate is validated** (positive whole number) and never silently defaulted; if it
@@ -409,8 +434,8 @@ sweeper.py sweep NEW_ADDRESS [--fee-rate SAT_PER_VB] [--addr OLD_ADDRESS ...] [-
     only the given address(es). Never broadcasts.
 ```
 
-Destination address can be `1…`, `3…`, or `bc1q…` (mainnet). Taproot `bc1p…` is not
-supported as a destination.
+Destination address can be `1…`, `3…`, `bc1q…`, or `bc1p…` (mainnet). `--path`/`--kind`
+(custom derivation) and `--accounts` are accepted by `addresses`, `scan`, `sign`, `sweep`.
 
 ---
 
@@ -440,10 +465,12 @@ re-auditing.
 .venv/bin/python tests/test_all.py
 ```
 
-The suite validates the verifier against the BIP143 spec vector, signs every supported
-input type (BIP44/49/84, Electrum v2 standard/segwit, Electrum v1 uncompressed) from
-throw-away test seeds and verifies them independently, and includes a negative test that
-reproduces a real signing bug to prove the verifier catches it.
+The suite validates the verifier against the BIP143 spec vector and the BIP84/BIP86
+derivation vectors, signs every supported input type (BIP44/49/84/86, BIP32 `m/0'`, custom
+paths, Electrum v2 standard/segwit, Electrum v1 uncompressed) from throw-away test seeds
+and verifies them independently (legacy, BIP143 and BIP341 sighash), and includes negative
+tests that reproduce a real signing bug and tampered taproot transactions to prove the
+verifier catches them.
 
 ---
 

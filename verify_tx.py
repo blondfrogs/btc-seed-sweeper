@@ -27,6 +27,11 @@ def hash160(b):
     return hashlib.new("ripemd160", hashlib.sha256(b).digest()).digest()
 
 
+def tagged_hash(tag, data):
+    t = hashlib.sha256(tag.encode()).digest()
+    return hashlib.sha256(t + t + data).digest()
+
+
 # ----------------------------------------------------------------------------- parsing
 
 class Reader:
@@ -123,6 +128,8 @@ def classify(spk):
         return "p2sh", spk[2:22]
     if len(spk) == 22 and spk[:2] == b"\x00\x14":
         return "p2wpkh", spk[2:]
+    if len(spk) == 34 and spk[:2] == b"\x51\x20":
+        return "p2tr", spk[2:]
     raise ValueError(f"unsupported scriptPubKey {spk.hex()}")
 
 
@@ -155,6 +162,23 @@ def bip143_sighash(tx, idx, script_code, value):
     return sha256d(b)
 
 
+def bip341_sighash(tx, idx, prevouts, hash_type):
+    """BIP341 key-path sighash, no annex. prevouts: [(spk_bytes, value)] for ALL inputs."""
+    if hash_type not in (0x00, 0x01):
+        raise ValueError("only SIGHASH_DEFAULT / SIGHASH_ALL supported")
+    sha = lambda b: hashlib.sha256(b).digest()
+    sha_prevouts = sha(b"".join(t["prev_hash"] + struct.pack("<I", t["index"]) for t in tx["ins"]))
+    sha_amounts = sha(b"".join(struct.pack("<Q", v) for _, v in prevouts))
+    sha_spks = sha(b"".join(varbytes(s) for s, _ in prevouts))
+    sha_sequences = sha(b"".join(struct.pack("<I", t["seq"]) for t in tx["ins"]))
+    sha_outputs = sha(_serialize_outs(tx))
+    msg = (b"\x00" + bytes([hash_type]) + struct.pack("<I", tx["version"]) + struct.pack("<I", tx["locktime"])
+           + sha_prevouts + sha_amounts + sha_spks + sha_sequences + sha_outputs
+           + b"\x00"                       # spend_type: key path, no annex
+           + struct.pack("<I", idx))
+    return tagged_hash("TapSighash", msg)
+
+
 # ----------------------------------------------------------------------------- verification
 
 def _check_sig(sig_with_type, pubkey, digest):
@@ -172,9 +196,26 @@ def _check_sig(sig_with_type, pubkey, digest):
         raise ValueError("signature does not verify")
 
 
-def verify_input(tx, idx, spk, value):
+def verify_input(tx, idx, spk, value, prevouts=None):
+    """prevouts (all inputs, [(spk, value)]) is required only for taproot inputs."""
     kind, h = classify(spk)
     tin = tx["ins"][idx]
+    if kind == "p2tr":
+        if tin["script_sig"] or len(tin["witness"]) != 1:
+            raise ValueError("p2tr: expected empty scriptSig and a 1-item witness (key path)")
+        sig = tin["witness"][0]
+        if len(sig) == 64:
+            hash_type = 0x00
+        elif len(sig) == 65 and sig[64] == 0x01:
+            hash_type = 0x01
+        else:
+            raise ValueError("p2tr: signature must be 64 bytes (default) or 65 with SIGHASH_ALL")
+        if prevouts is None:
+            raise ValueError("p2tr: prevouts for all inputs required")
+        digest = bip341_sighash(tx, idx, prevouts, hash_type)
+        if not coincurve.PublicKeyXOnly(h).verify(sig[:64], digest):
+            raise ValueError("p2tr: schnorr signature does not verify")
+        return "p2tr"
     if kind == "p2pkh":
         items = parse_pushes(tin["script_sig"])
         if len(items) != 2 or tin["witness"]:
@@ -227,9 +268,10 @@ def verify(raw_hex, prevouts):
     total_out = sum(o["value"] for o in tx["outs"])
     if total_out > total_in:
         raise ValueError("outputs exceed inputs")
+    allp = [(bytes.fromhex(p["script_pubkey"]), p["value"]) for p in prevouts]
     kinds = []
-    for i, p in enumerate(prevouts):
-        kinds.append(verify_input(tx, i, bytes.fromhex(p["script_pubkey"]), p["value"]))
+    for i, (spk, value) in enumerate(allp):
+        kinds.append(verify_input(tx, i, spk, value, allp))
     return kinds
 
 
@@ -261,9 +303,11 @@ def _bech32_decode(addr):
                 chk ^= GEN[i] if (top >> i) & 1 else 0
         return chk
     hrp_exp = [ord(c) >> 5 for c in hrp] + [0] + [ord(c) & 31 for c in hrp]
-    if polymod(hrp_exp + vals) != 1:
-        raise ValueError("bad bech32 checksum")
+    const = polymod(hrp_exp + vals)
     ver, prog5 = vals[0], vals[1:-6]
+    # BIP173 bech32 for witness v0, BIP350 bech32m for v1+
+    if (ver == 0 and const != 1) or (ver != 0 and const != 0x2bc830a3):
+        raise ValueError("bad bech32/bech32m checksum")
     acc, bits, out = 0, 0, bytearray()
     for v in prog5:
         acc = (acc << 5) | v
@@ -294,9 +338,11 @@ def spk_for_address(addr):
     """scriptPubKey for a 1.../3.../bc1q... address, computed here without bitcoinutils."""
     if addr.startswith("bc1"):
         ver, prog = _bech32_decode(addr)
-        if ver != 0:
-            raise ValueError("only witness v0 supported")
-        return bytes([0, len(prog)]) + prog
+        if ver == 0:
+            return bytes([0, len(prog)]) + prog
+        if ver == 1 and len(prog) == 32:
+            return b"\x51\x20" + prog
+        raise ValueError("unsupported witness version/program")
     raw = _b58decode(addr)
     if raw[0] == 0x00:
         return p2pkh_script(raw[1:])
