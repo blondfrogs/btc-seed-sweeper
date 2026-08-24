@@ -372,6 +372,13 @@ one is too old. Or install a newer Python yourself and create the venv with it:
 
 Then `.venv/bin/pip install -r requirements.txt` as usual.
 
+**"Failed to build wheel for cbor2"** (or anything mentioning Rust / cargo / compiler).
+`cbor2` is pulled in by `bip_utils`; its 6.x releases need a Rust toolchain to build and ship
+no wheels for Intel Macs or older Linux. `requirements.txt` now pins `cbor2==5.6.5`, which
+has wheels for every platform plus a pure-Python fallback — `git pull` and reinstall:
+`.venv/bin/pip install -r requirements.txt`. (cbor2 is only used by `bip_utils` for
+non-Bitcoin coins; it plays no part in Bitcoin key handling.)
+
 **Windows users:** replace `.venv/bin/python` with `.venv\Scripts\python`.
 
 ---
@@ -441,8 +448,9 @@ Destination address can be `1…`, `3…`, `bc1q…`, or `bc1p…` (mainnet). `-
 
 ## Verifying the dependencies yourself
 
-`requirements.txt` pins `bip_utils==2.12.2`, `bitcoin-utils==0.8.2`, `coincurve==21.0.0`
-and `requests==2.34.2`.
+`requirements.txt` pins `bip_utils==2.12.2`, `bitcoin-utils==0.8.2`, `coincurve==21.0.0`,
+`requests==2.34.2` and `cbor2==5.6.5` (a `bip_utils` dependency pinned for installability;
+not used on the Bitcoin path).
 These versions were audited by:
 
 1. Re-downloading each wheel from PyPI and SHA-256-comparing **every installed file** against

@@ -3,3 +3,7 @@ bip_utils==2.12.2
 bitcoin-utils==0.8.2
 coincurve==21.0.0
 requests==2.34.2
+# cbor2 is pulled in by bip_utils (used only for non-Bitcoin coins). cbor2 6.x needs a
+# Rust toolchain to build and has no wheels for Intel macOS / older Linux; 5.6.5 has
+# wheels everywhere plus a pure-Python fallback.
+cbor2==5.6.5
