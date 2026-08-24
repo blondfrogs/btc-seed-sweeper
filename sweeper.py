@@ -12,7 +12,10 @@ Usage:
     python sweeper.py sweep <new_address>  # build + sign, print raw tx hex
 """
 import argparse
+import ctypes
+import gc
 import getpass
+import resource
 import sys
 import time
 from dataclasses import dataclass, field
@@ -36,6 +39,18 @@ GAP_LIMIT = 20          # unused addresses in a row before we stop scanning a ch
 DUST = 546              # sats
 btc_setup("mainnet")
 
+# Never let a crash write process memory (and the seed) to disk.
+try:
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+except Exception:
+    pass
+
+
+def wipe(buf):
+    """Overwrite a bytearray in place with zeros."""
+    if isinstance(buf, bytearray) and len(buf):
+        ctypes.memset((ctypes.c_char * len(buf)).from_buffer(buf), 0, len(buf))
+
 # ----------------------------------------------------------------------------- data
 
 @dataclass
@@ -45,7 +60,7 @@ class Coin:
     value: int            # sats
     address: str
     kind: str             # p2pkh | p2sh-p2wpkh | p2wpkh
-    wif: str
+    priv: bytearray      # raw 32-byte private key; zeroed after signing
     path: str
 
 @dataclass
@@ -107,7 +122,7 @@ def wallet_candidates(mnemonic, passphrase):
                     i = 0
                     while True:
                         k = chain.AddressIndex(i)
-                        yield k.PublicKey().ToAddress(), k.PrivateKey().ToWif(), kind, f"{label}/{cname}/{i}"
+                        yield k.PublicKey().ToAddress(), bytearray(k.PrivateKey().Raw().ToBytes()), kind, f"{label}/{cname}/{i}"
                         i += 1
                 yield f"{label} chain {cname}", gen()
 
@@ -123,7 +138,7 @@ def wallet_candidates(mnemonic, passphrase):
                 def gen(w=w, cname=cname, label=label, kind=kind):
                     i = 0
                     while True:
-                        yield (w.GetAddress(cname, i), w.GetPrivateKey(cname, i).ToWif(),
+                        yield (w.GetAddress(cname, i), bytearray(w.GetPrivateKey(cname, i).Raw().ToBytes()),
                                kind, f"{label}/{cname}/{i}")
                         i += 1
                 yield f"{label} chain {cname}", gen()
@@ -134,7 +149,7 @@ def wallet_candidates(mnemonic, passphrase):
             def gen(w=w, cname=cname):
                 i = 0
                 while True:
-                    yield w.GetAddress(cname, i), w.GetPrivateKey(cname, i).ToWif(), "p2pkh", f"ElectrumV1/{cname}/{i}"
+                    yield w.GetAddress(cname, i), bytearray(w.GetPrivateKey(cname, i).Raw().ToBytes()), "p2pkh", f"ElectrumV1/{cname}/{i}"
                     i += 1
             yield f"Electrum v1 (old) chain {cname}", gen()
 
@@ -145,17 +160,21 @@ def scan(mnemonic, passphrase):
         any_scheme = True
         print(f"  scanning {label} ...", end="", flush=True)
         gap, found = 0, 0
-        for addr, wif, kind, path in chain:
+        for addr, priv, kind, path in chain:
             res.checked += 1
             time.sleep(0.15)   # be polite to the public API
             if not address_used(addr):
+                wipe(priv)          # unused address: forget its key immediately
                 gap += 1
                 if gap >= GAP_LIMIT:
                     break
                 continue
             gap = 0
-            for u in get_utxos(addr):
-                res.coins.append(Coin(u["txid"], u["vout"], u["value"], addr, kind, wif, path))
+            utxos = get_utxos(addr)
+            if not utxos:
+                wipe(priv)
+            for u in utxos:
+                res.coins.append(Coin(u["txid"], u["vout"], u["value"], addr, kind, priv, path))
                 found += u["value"]
         print(f" {found/1e8:.8f} BTC")
     if not any_scheme:
@@ -180,7 +199,7 @@ def build_and_sign(coins, dest, rate):
     tx = Transaction(ins, outs, has_segwit=has_segwit)
 
     for i, c in enumerate(coins):
-        pk = PrivateKey(c.wif)
+        pk = PrivateKey(secret_exponent=int.from_bytes(bytes(c.priv), "big"))
         pub = pk.get_public_key()
         if c.kind == "p2pkh":
             sig = pk.sign_input(tx, i, pub.get_address().to_script_pub_key())
@@ -193,6 +212,9 @@ def build_and_sign(coins, dest, rate):
             if c.kind == "p2sh-p2wpkh":
                 ins[i].script_sig = Script([pub.get_segwit_address().to_script_pub_key().to_hex()])
             tx.witnesses.append(TxWitnessInput([sig, pub.to_hex()]))
+        wipe(c.priv)                # this key has done its one job
+        del pk
+    gc.collect()
     return tx, send, fee, vb
 
 def _dest_script(addr):
@@ -212,6 +234,13 @@ def read_secret():
     p = getpass.getpass("BIP39 passphrase (leave empty if you never set one): ")
     return m, p
 
+
+def forget(*names, scope):
+    """Drop references and force collection so secrets are freed promptly."""
+    for n in names:
+        scope.pop(n, None)
+    gc.collect()
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -230,6 +259,7 @@ def main():
     mnemonic, passphrase = read_secret()
     print("\nScanning (read-only) ...")
     res = scan(mnemonic, passphrase)
+    forget("mnemonic", "passphrase", scope=locals())   # words no longer needed
     print(f"\nChecked {res.checked} addresses. Found {len(res.coins)} coin(s), total {res.total/1e8:.8f} BTC")
     for c in res.coins:
         print(f"  {c.value/1e8:.8f}  {c.address}  ({c.path})")
@@ -249,6 +279,9 @@ def main():
     print(raw)
     print("\nWhen ready, paste it at https://mempool.space/tx/push (or any node/explorer).")
     print(f"Then track it: https://mempool.space/tx/{tx.get_txid()}")
+    for c in res.coins:
+        wipe(c.priv)
+    forget("res", "tx", "raw", scope=locals())
 
 if __name__ == "__main__":
     main()

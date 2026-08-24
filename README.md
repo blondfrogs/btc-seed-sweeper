@@ -31,3 +31,11 @@ SHA-256-matched against the PyPI wheel; no network code in any key-handling libr
 ## Disclaimer
 Use at your own risk. Always run `scan` first, review the summary, and test your destination address
 before sweeping real funds. MIT licensed.
+
+## Memory hygiene
+- Core dumps are disabled at startup so a crash can't write the seed to disk.
+- Private keys are held as mutable byte buffers and zeroed the moment they're no longer
+  needed (unused addresses immediately; funded ones right after signing).
+- The seed phrase and passphrase are dropped as soon as scanning finishes.
+- Python can't guarantee erasure of every interpreter-internal copy, so for real safety
+  run the sweep on a clean machine and shut it down (not just close the terminal) afterwards.
