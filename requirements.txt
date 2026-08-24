@@ -1,3 +1,4 @@
 bip_utils==2.12.2
 bitcoin-utils==0.8.2
 requests==2.34.2
+coincurve==21.0.0

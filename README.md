@@ -4,9 +4,10 @@ Recover bitcoin from an old wallet's seed phrase and move it to a new address �
 ever putting the seed on an internet-connected computer, and without trusting this tool to
 send anything.**
 
-It's a single Python file. It derives your keys locally, builds and signs one transaction
-that sends the entire balance to an address you choose, and prints the signed transaction
-as hex. **It never broadcasts.** You submit the hex yourself when you're ready.
+It derives your keys locally, builds and signs one transaction that sends the entire
+balance to an address you choose, **independently re-verifies every signature** against a
+from-spec implementation before showing you anything, and prints the signed transaction as
+hex. **It never broadcasts.** You submit the hex yourself when you're ready.
 
 ---
 
@@ -98,11 +99,16 @@ On the offline machine, with networking disabled:
 
 You'll be asked for the seed phrase (input is hidden) and the passphrase (press Enter if
 you never set one). It writes `addresses.json` containing the first 100 addresses of every
-derivation scheme it knows — **addresses only, no keys**. Example of what's inside:
+derivation scheme it knows — **addresses only, no keys** (BIP39 addresses are derived from
+the account *xpub*, so no per-address private key is even created). Example of what's inside:
 
 ```json
-[{"address": "1LqBGSKuX5yY…", "kind": "p2pkh", "path": "BIP44 legacy m/44'/0'/0'/0/0"}, …]
+[{"address": "1LqBGSKuX5yY…", "kind": "p2pkh", "scheme": "bip44", "chain": 0, "index": 0,
+  "path": "BIP44 legacy m/44'/0'/0'/0/0"}, …]
 ```
+
+The `scheme/chain/index` fields let `sign` derive exactly the right key later instead of
+searching for it, so use `addresses.json` rather than `--addr` when you can.
 
 If the wallet was used heavily (more than ~100 addresses per chain), raise the count:
 `--per-chain 300`.
@@ -129,12 +135,17 @@ or, without an address file:
 prints what it found, and writes `utxos.json`:
 
 ```
-Fetching UTXOs for 1800 addresses (read-only) ...
-Found 2 coin(s), total 0.31500000 BTC. Fee rate now 4 sat/vB.
+Fetching UTXOs for 1200 addresses (read-only) ...
+Found 2 coin(s), total 0.31500000 BTC.
   0.30000000  1LqBGSKuX5yYUonjxT5qGfpUsXKYYWeabA
   0.01500000  bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu
+Fee rate now 4 sat/vB (saved for `sign`).
 Wrote utxos.json. Take this file to the offline machine.
 ```
+
+If it prints `WARNING: could not fetch the current fee rate`, look up a sensible sat/vB on
+https://mempool.space and pass it to `sign` with `--fee-rate`. Coins marked `(UNCONFIRMED)`
+are included; wait for confirmation if you want to be safe.
 
 If it reports **0 coins**, stop here and read [Troubleshooting](#troubleshooting).
 
@@ -149,7 +160,8 @@ Copy `utxos.json` back to the offline machine. Then:
 It will:
 1. Make you **retype the destination address** (guards against clipboard malware / typos).
 2. Ask for the seed phrase and passphrase.
-3. Re-derive only the keys needed, sign, and print a summary plus the raw hex:
+3. Re-derive only the keys needed, sign, **independently verify every signature**
+   (see [Security model](#security-model)), and print a summary plus the raw hex:
 
 ```
 === SWEEP SUMMARY ===
@@ -165,7 +177,12 @@ Raw signed transaction hex (NOT broadcast — this tool never submits):
 
 **Check the summary carefully.** The `to` address must be yours, and `amount + fee` should
 equal the total. The fee rate comes from `utxos.json` (captured in Step 2); override with
-`--fee-rate 20` if the network got busier since then.
+`--fee-rate 20` if the network got busier since then. The fee is charged on the transaction's
+*actual* size, not the estimate.
+
+If an address in `utxos.json` has no `scheme/chain/index` (because you used `--addr`),
+`sign` searches the first 2000 addresses of every chain for it. For a very heavily used
+wallet, raise that with `--max-index 10000`.
 
 ### Step 4 — ONLINE: broadcast it yourself
 
@@ -229,10 +246,13 @@ gap limit), so it finds everything the wallet ever used. `sweep` still never bro
 | BIP39 | BIP84 native segwit | `bc1q…` | `m/84'/0'/0'/{0,1}/i` |
 | Electrum v2 | standard | `1…` | Electrum's own |
 | Electrum v2 | segwit | `bc1q…` | Electrum's own |
-| Electrum v1 (pre-2014) | legacy | `1…` | Electrum's own |
+| Electrum v1 (pre-2014) | legacy, uncompressed keys | `1…` | Electrum's own |
 
 That covers Electrum, Ledger, Trezor, Mycelium (recent), Samourai, Wasabi, BlueWallet,
 Exodus, Coinomi, Trust Wallet, and most others. Receive **and** change chains are scanned.
+Electrum seeds are detected by type (standard vs segwit) so only the matching chains are
+walked, and Electrum passphrases are normalised the way Electrum does it (case, accents,
+spacing); BIP39 passphrases are used verbatim, as BIP39 requires.
 
 Not covered (yet): accounts other than 0, Taproot (`m/86'`), and wallets with unusual paths
 (Multibit HD, early Bread/Mycelium, Bitcoin Core descriptor wallets, some Coinomi versions).
@@ -260,7 +280,12 @@ are lowercase and separated by single spaces; the tool normalises spacing for yo
 
 **"This seed does not control these addresses"** (during `sign`).
 The addresses in `utxos.json` weren't derived from this seed/passphrase. Usually a typo in
-the seed or a forgotten passphrase.
+the seed or a forgotten passphrase. If you used `--addr` on a heavily used wallet, the
+address may simply be deeper than the default search — retry with `--max-index 10000`.
+
+**"INTERNAL ERROR: signed transaction failed independent verification".**
+The built-in verifier rejected the transaction the signer produced. Nothing was printed and
+nothing is at risk; please open an issue with the (public) `utxos.json` and the error text.
 
 **"429 Too Many Requests" / network errors.**
 The public APIs rate-limit. The tool retries with backoff and alternates between two
@@ -283,9 +308,18 @@ What this tool does to protect you:
 - **Seed never needs to be online.** `fetch` works from addresses alone.
 - **Whole balance to one address you control** — no change output that could be stranded.
 - **Destination is double-entered** and validated before the seed is requested.
-- **Memory hygiene:** private keys are held as mutable buffers and zeroed the moment
-  they're no longer needed; the seed is dropped after derivation; core dumps are disabled
-  so a crash can't write the seed to disk. Nothing secret is ever written to a file.
+- **Every signature is independently verified before output.** `verify_tx.py` is a
+  separate, from-spec implementation of the legacy and BIP143 sighash algorithms (validated
+  against the official BIP143 test vector) using libsecp256k1. `sweeper.py` runs it on every
+  transaction it builds and refuses to print hex that doesn't pass — a signing bug can't
+  reach you as a rejected broadcast. It also checks the fee estimate against the real size.
+- **Fee rate is validated** (positive whole number) and never silently defaulted; if it
+  couldn't be fetched you are told to supply one.
+- **Memory hygiene (best effort):** private keys are held as mutable buffers and zeroed
+  once they're no longer needed (including on the `scan`-only path and on errors); the
+  seed is dropped after derivation; the `addresses` command never creates per-address
+  private keys at all; core dumps are disabled so a crash can't write the seed to disk.
+  Nothing secret is ever written to a file. See the caveat below.
 - **Read-only network calls only** (address lookups, UTXO lists, fee estimate), and only
   in `scan`, `sweep`, and `fetch`. `addresses` and `sign` make no network calls at all.
 - **Pinned, audited dependencies** — see below.
@@ -293,8 +327,10 @@ What this tool does to protect you:
 What it can't protect you from:
 
 - **A compromised offline machine** (keylogger, malicious OS). Use a fresh live-USB boot.
-- **Python's memory model.** Immutable strings and library internals may leave copies in
-  RAM. Shutting down the offline machine afterwards is the real guarantee.
+- **Python's memory model.** The mnemonic string, the BIP39 seed bytes, and intermediate
+  key objects inside the libraries are immutable and cannot be zeroed from Python; they
+  stay in RAM (and potentially swap/hibernation files) until overwritten. Shutting the
+  offline machine **down** afterwards is the real guarantee.
 - **You sending to the wrong address.** Test the destination first (Step 0).
 
 ---
@@ -308,13 +344,13 @@ sweeper.py addresses [-o addresses.json] [-n PER_CHAIN]
 sweeper.py fetch [addresses.json] [--addr A1 A2 ...] [-o utxos.json]
     ONLINE, no seed. Looks up UTXOs and current fee rate for the given addresses.
 
-sweeper.py sign utxos.json NEW_ADDRESS [--fee-rate SAT_PER_VB]
-    OFFLINE. Seed + utxos -> signed raw tx hex. Never broadcasts.
+sweeper.py sign utxos.json NEW_ADDRESS [--fee-rate SAT_PER_VB] [--max-index N]
+    OFFLINE. Seed + utxos -> signed, self-verified raw tx hex. Never broadcasts.
 
 sweeper.py scan
     ONLINE + seed. Walks all derivation chains with a gap limit of 20 and reports balances.
 
-sweeper.py sweep NEW_ADDRESS [--fee-rate SAT_PER_VB] [--addr OLD_ADDRESS ...]
+sweeper.py sweep NEW_ADDRESS [--fee-rate SAT_PER_VB] [--addr OLD_ADDRESS ...] [--max-index N]
     ONLINE + seed. scan + sign in one go. With --addr, skips the scan and sweeps
     only the given address(es). Never broadcasts.
 ```
@@ -326,7 +362,8 @@ supported as a destination.
 
 ## Verifying the dependencies yourself
 
-`requirements.txt` pins `bip_utils==2.12.2`, `bitcoin-utils==0.8.2`, `requests==2.34.2`.
+`requirements.txt` pins `bip_utils==2.12.2`, `bitcoin-utils==0.8.2`, `requests==2.34.2`,
+`coincurve==21.0.0`.
 These versions were audited by:
 
 1. Re-downloading each wheel from PyPI and SHA-256-comparing **every installed file** against
@@ -342,6 +379,17 @@ These versions were audited by:
 
 To repeat the check: `pip install pip-audit && pip-audit`. Don't bump versions without
 re-auditing.
+
+## Running the tests
+
+```bash
+.venv/bin/python tests/test_all.py
+```
+
+The suite validates the verifier against the BIP143 spec vector, signs every supported
+input type (BIP44/49/84, Electrum v2 standard/segwit, Electrum v1 uncompressed) from
+throw-away test seeds and verifies them independently, and includes a negative test that
+reproduces a real signing bug to prove the verifier catches it.
 
 ---
 
