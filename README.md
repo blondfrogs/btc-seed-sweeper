@@ -19,11 +19,12 @@ hex. **It never broadcasts.** You submit the hex yourself when you're ready.
 4. [Step-by-step: air-gapped sweep (recommended)](#step-by-step-air-gapped-sweep-recommended)
 5. [Already know the address? Skip the scan](#already-know-the-address-skip-the-scan)
 6. [One-machine mode (simpler, less safe)](#one-machine-mode-simpler-less-safe)
-7. [Which wallets does it support?](#which-wallets-does-it-support)
-8. [Troubleshooting](#troubleshooting)
-9. [Security model](#security-model)
-10. [Command reference](#command-reference)
-11. [Verifying the dependencies yourself](#verifying-the-dependencies-yourself)
+7. [Only have a private key, not a seed phrase?](#only-have-a-private-key-not-a-seed-phrase)
+8. [Which wallets does it support?](#which-wallets-does-it-support)
+9. [Troubleshooting](#troubleshooting)
+10. [Security model](#security-model)
+11. [Command reference](#command-reference)
+12. [Verifying the dependencies yourself](#verifying-the-dependencies-yourself)
 
 ---
 
@@ -51,7 +52,9 @@ signed hex instead of sending it, so you get a final chance to review before any
 ## What you need
 
 - **Your seed phrase** — 12 or 24 words (BIP39), or an Electrum seed. Plus the BIP39
-  passphrase ("25th word") if you ever set one. Most people didn't.
+  passphrase ("25th word") if you ever set one. Most people didn't. **Or** one or more
+  exported private keys in WIF format (`5…`, `K…`, `L…`) — see
+  [Only have a private key?](#only-have-a-private-key-not-a-seed-phrase).
 - **A new wallet** with a receive address to sweep into. Any modern wallet works
   (Sparrow, Electrum, BlueWallet, a hardware wallet, …). Use a `bc1q…` address if offered.
 - **Python 3.10 or newer** on each machine you'll use (`python3 --version` to check).
@@ -275,6 +278,23 @@ gap limit), so it finds everything the wallet ever used. `sweep` still never bro
 
 ---
 
+## Only have a private key, not a seed phrase?
+
+That works too. At the "Seed phrase or private key(s)" prompt, paste one or more **WIF**
+private keys instead of words — the format that starts with `5` (older, uncompressed) or
+`K`/`L` (compressed), 51–52 characters. Separate several keys with spaces. No passphrase
+is asked for.
+
+Every command behaves the same: `addresses` lists each key's possible addresses (a `1…`
+address for every key; `3…`, `bc1q…` and `bc1p…` too for compressed keys), `scan`/`fetch`
+look them up, `sign`/`sweep` sign with the right key and format (including old
+uncompressed-key addresses). `--test` and `--amount` work as usual.
+
+Where to find WIF keys: Bitcoin Core `dumpprivkey <address>`, Electrum *Wallet → Private
+keys → Export*, paper wallets (the "secret" side, often behind a scratch panel), and most
+wallets' "export private key" screens. Keys exported in other formats (BIP38 `6P…` encrypted
+keys, raw 64-hex keys, mini keys) aren't accepted yet — tell us and we'll add them.
+
 ## Which wallets does it support?
 
 Built-in derivation schemes (all scanned automatically; receive **and** change chains):
@@ -325,7 +345,7 @@ LTC, BCH, ETH, etc. — this tool neither sees nor touches them.
 
 ## Troubleshooting
 
-**"Seed phrase is not a valid BIP39 or Electrum mnemonic."**
+**"Not a valid BIP39 / Electrum seed phrase or WIF private key."**
 A word is misspelled or out of order. Check each against the
 [BIP39 word list](https://github.com/bitcoin/bips/blob/master/bip-0039/english.txt). Words
 are lowercase and separated by single spaces; the tool normalises spacing for you.
@@ -475,7 +495,8 @@ re-auditing.
 
 The suite validates the verifier against the BIP143 spec vector and the BIP84/BIP86
 derivation vectors, signs every supported input type (BIP44/49/84/86, BIP32 `m/0'`, custom
-paths, Electrum v2 standard/segwit, Electrum v1 uncompressed) from throw-away test seeds
+paths, Electrum v2 standard/segwit, Electrum v1 uncompressed, WIF keys compressed and
+uncompressed at every address type) from throw-away test seeds
 and verifies them independently (legacy, BIP143 and BIP341 sighash), and includes negative
 tests that reproduce a real signing bug and tampered taproot transactions to prove the
 verifier catches them.

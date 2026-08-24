@@ -22,6 +22,7 @@ One-machine usage:
     python sweeper.py sweep <new_address> --addr <old_address>   # sweep one known address
 
 Unusual wallet?  --path "m/0'/7'" --kind p2pkh   adds a custom derivation base path.
+Only have private key(s)?  Paste WIF key(s) (5..., K..., L...) at the seed prompt instead.
 """
 import argparse
 import ctypes
@@ -118,6 +119,9 @@ def scheme_info(scheme):
     if scheme.startswith("custom:"):
         _, path, kind = scheme.split(":", 2)
         return dict(label=f"custom {path}", kind=kind, base=path, uncompressed=False, has_accounts=False)
+    if scheme.startswith("wif:"):
+        kind = scheme[4:]
+        return dict(label=f"WIF key ({kind})", kind=kind, base=None, uncompressed=None, has_accounts=False, wif=True)
     d = SCHEMES[scheme]
     return dict(label=d["label"], kind=d["kind"], base=d["base"],
                 uncompressed=d.get("uncompressed", False), has_accounts=d["base"] is not None)
@@ -125,6 +129,8 @@ def scheme_info(scheme):
 
 def path_str(scheme, account, chain, index):
     info = scheme_info(scheme)
+    if info.get("wif"):
+        return f"WIF key #{index + 1} ({info['kind']})"
     return f"{info['label'].replace('{a}', str(account))}/{chain}/{index}"
 
 
@@ -133,6 +139,28 @@ def electrum_normalize(text):
     text = unicodedata.normalize("NFKD", text).lower()
     text = "".join(c for c in text if not unicodedata.combining(c))
     return " ".join(text.split())
+
+
+_WIF_RE = re.compile(r"^(5[1-9A-HJ-NP-Za-km-z]{50}|[KL][1-9A-HJ-NP-Za-km-z]{51})$")
+WIF_KINDS = ("p2pkh", "p2sh-p2wpkh", "p2wpkh", "p2tr")
+
+
+def looks_like_wif_list(text):
+    toks = text.replace(",", " ").split()
+    return bool(toks) and all(_WIF_RE.match(t) for t in toks)
+
+
+def parse_wifs(text):
+    """-> [(priv bytearray, compressed bool)]; exits on a bad key."""
+    out = []
+    for t in text.replace(",", " ").split():
+        try:
+            pk = PrivateKey(wif=t)
+        except Exception:
+            sys.exit(f"Invalid private key (bad WIF checksum?): {t[:6]}…")
+        out.append((bytearray(pk.to_bytes()), pk.is_compressed() if hasattr(pk, "is_compressed") else t[0] in "KL"))
+        del pk
+    return out
 
 
 # ----------------------------------------------------------------------------- data
@@ -228,7 +256,9 @@ def _electrum_v2_type(mnemonic):
 
 
 def seed_schemes(mnemonic, custom=()):
-    """Which scheme ids could this mnemonic belong to?"""
+    """Which scheme ids could this secret (mnemonic or WIF list) belong to?"""
+    if looks_like_wif_list(mnemonic):
+        return ["wif:" + k for k in WIF_KINDS]
     out = []
     if Bip39MnemonicValidator().IsValid(mnemonic):
         out += ["bip44", "bip49", "bip84", "bip86", "bip32h"] + list(custom)
@@ -240,7 +270,7 @@ def seed_schemes(mnemonic, custom=()):
     if ElectrumV1MnemonicValidator().IsValid(mnemonic):
         out.append("el1")
     if not out:
-        sys.exit("Seed phrase is not a valid BIP39 or Electrum mnemonic. Check spelling/word order.")
+        sys.exit("Not a valid BIP39 / Electrum seed phrase or WIF private key. Check spelling/word order.")
     return out
 
 
@@ -252,6 +282,7 @@ class Roots:
         self.public_only = public_only
         self.master = None
         self.nodes = {}
+        self.wifs = parse_wifs(mnemonic) if any(s.startswith("wif:") for s in schemes) else []
         if any(scheme_info(s)["base"] is not None for s in schemes):
             seed = Bip39SeedGenerator(mnemonic).Generate(passphrase)
             self.master = Bip32Slip10Secp256k1.FromSeed(seed)
@@ -280,9 +311,37 @@ class Roots:
             self.nodes[key] = n
         return self.nodes[key]
 
+    def size(self, scheme):
+        """Number of addresses a scheme has per chain, or None if unbounded."""
+        return len(self.wifs) if scheme.startswith("wif:") else None
+
+    def compressed(self, scheme, index):
+        if scheme.startswith("wif:"):
+            return self.wifs[index][1]
+        return not scheme_info(scheme)["uncompressed"]
+
     def derive(self, scheme, account, chain, index):
-        """-> (address, priv bytearray or None)"""
+        """-> (address, priv bytearray or None). (None, None) past the end of a finite scheme
+        or for an address type this key can't have (uncompressed keys are legacy-only)."""
         info = scheme_info(scheme)
+        if info.get("wif"):
+            if chain != 0 or index >= len(self.wifs):
+                return None, None
+            raw, compressed = self.wifs[index]
+            if info["kind"] != "p2pkh" and not compressed:
+                return None, None
+            pk = PrivateKey(b=bytes(raw))
+            pub = pk.get_public_key()
+            del pk
+            if info["kind"] == "p2pkh":
+                addr = pub.get_address(compressed=compressed).to_string()
+            elif info["kind"] == "p2sh-p2wpkh":
+                addr = P2shAddress.from_script(pub.get_segwit_address().to_script_pub_key()).to_string()
+            elif info["kind"] == "p2wpkh":
+                addr = pub.get_segwit_address().to_string()
+            else:
+                addr = pub.get_taproot_address().to_string()
+            return addr, (None if self.public_only else bytearray(raw))
         node = self.node(scheme, account)
         if info["base"] is None:                       # Electrum
             addr = node.GetAddress(chain, index)
@@ -305,13 +364,16 @@ class Roots:
     def close(self):
         self.master = None
         self.nodes.clear()
+        for raw, _ in self.wifs:
+            wipe(raw)
+        self.wifs = []
         gc.collect()
 
 
-def make_coin(u, addr, scheme, account, chain, index, priv):
+def make_coin(u, addr, scheme, account, chain, index, priv, compressed):
     info = scheme_info(scheme)
     return Coin(u["txid"], u["vout"], u["value"], addr, info["kind"], priv,
-                path_str(scheme, account, chain, index), not info["uncompressed"])
+                path_str(scheme, account, chain, index), compressed)
 
 
 def list_addresses(mnemonic, passphrase, per_chain, accounts=1, custom=()):
@@ -323,8 +385,11 @@ def list_addresses(mnemonic, passphrase, per_chain, accounts=1, custom=()):
         n_acc = accounts if scheme_info(scheme)["has_accounts"] else 1
         for account in range(n_acc):
             for chain in (0, 1):
-                for i in range(per_chain):
+                n = per_chain if roots.size(scheme) is None else roots.size(scheme)
+                for i in range(n):
                     addr, _ = roots.derive(scheme, account, chain, i)
+                    if addr is None:
+                        continue
                     out.append({"address": addr, "kind": scheme_info(scheme)["kind"], "scheme": scheme,
                                 "account": account, "chain": chain, "index": i,
                                 "path": path_str(scheme, account, chain, i)})
@@ -342,7 +407,7 @@ def keys_for(mnemonic, passphrase, wanted, max_index=2000, accounts=1, custom=()
 
     def record(addr, scheme, account, chain, index, priv):
         info = scheme_info(scheme)
-        found[addr] = (info["kind"], path_str(scheme, account, chain, index), priv, not info["uncompressed"])
+        found[addr] = (info["kind"], path_str(scheme, account, chain, index), priv, roots.compressed(scheme, index))
 
     # 1. exact derivations
     for addr, loc in wanted.items():
@@ -356,6 +421,8 @@ def keys_for(mnemonic, passphrase, wanted, max_index=2000, accounts=1, custom=()
             got, priv = roots.derive(s, acc, ch, ix)
         except Exception:
             continue
+        if got is None:
+            continue
         if got == addr:
             record(addr, s, acc, ch, ix, priv)
         else:
@@ -368,10 +435,12 @@ def keys_for(mnemonic, passphrase, wanted, max_index=2000, accounts=1, custom=()
             n_acc = accounts if scheme_info(scheme)["has_accounts"] else 1
             for account in range(n_acc):
                 for chain in (0, 1):
-                    for i in range(max_index):
+                    for i in range(max_index if roots.size(scheme) is None else roots.size(scheme)):
                         if not remaining:
                             break
                         addr, priv = roots.derive(scheme, account, chain, i)
+                        if addr is None:
+                            continue
                         if addr in remaining:
                             record(addr, scheme, account, chain, i, priv)
                             remaining.discard(addr)
@@ -447,6 +516,11 @@ def scan(mnemonic, passphrase, max_accounts=MAX_ACCOUNTS, custom=()):
                 gap, found, i = 0, 0, 0
                 while gap < GAP_LIMIT:
                     addr, priv = roots.derive(scheme, account, chain, i)
+                    if addr is None:
+                        if roots.size(scheme) is not None and i >= roots.size(scheme):
+                            break           # finite scheme (WIF keys): no more addresses
+                        i += 1
+                        continue
                     res.checked += 1
                     time.sleep(0.15)   # be polite to the public API
                     if not address_used(addr):
@@ -458,7 +532,8 @@ def scan(mnemonic, passphrase, max_accounts=MAX_ACCOUNTS, custom=()):
                         if not utxos:
                             wipe(priv)
                         for u in utxos:
-                            res.coins.append(make_coin(u, addr, scheme, account, chain, i, priv))
+                            res.coins.append(make_coin(u, addr, scheme, account, chain, i, priv,
+                                                       roots.compressed(scheme, i)))
                             found += u["value"]
                     i += 1
                 print(f" {found/1e8:.8f} BTC")
@@ -594,8 +669,12 @@ def _dest_script(addr):
 # ----------------------------------------------------------------------------- cli
 
 def read_secret():
-    print("Seed phrase input is hidden. Paste/type the words separated by spaces.")
-    m = " ".join(getpass.getpass("Seed phrase: ").strip().lower().split())
+    print("Input is hidden. Paste/type your seed phrase (words separated by spaces),")
+    print("or one or more private keys in WIF format (5..., K..., L...) separated by spaces.")
+    raw = getpass.getpass("Seed phrase or private key(s): ").strip()
+    if looks_like_wif_list(raw):
+        return " ".join(raw.replace(",", " ").split()), ""      # WIF is case-sensitive; no passphrase
+    m = " ".join(raw.lower().split())
     p = getpass.getpass("BIP39 passphrase (leave empty if you never set one): ")
     return m, p
 

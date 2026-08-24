@@ -122,6 +122,36 @@ for label, r, val in (("tampered output", h[:120]+("0" if h[120]!="0" else "1")+
     try: verify(r,[{"script_pubkey":spk_for_address(c[0].address).hex(),"value":val}]); print("  FAIL", label); sys.exit(1)
     except ValueError as e: print(f"  taproot {label} caught ✓ ({e})")
 
+print("== H. WIF private keys ==")
+WC="KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qYjgd9M7rFU73sVHnoWn"   # privkey = 1, compressed
+WU="5HpHagT65TZzG1PH3CSu63k8DbpvD8s5ip4nEB3kEsreAnchuDf"    # privkey = 1, uncompressed
+assert looks_like_wif_list(WC) and looks_like_wif_list(f"{WC}, {WU}") and not looks_like_wif_list(BIP) and not looks_like_wif_list(WC[:-1]+"0")
+assert seed_schemes(WC)==["wif:p2pkh","wif:p2sh-p2wpkh","wif:p2wpkh","wif:p2tr"]
+R=Roots(f"{WC} {WU}","",seed_schemes(WC))
+assert R.derive("wif:p2pkh",0,0,0)[0]=="1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH"      # well-known vectors for k=1
+assert R.derive("wif:p2pkh",0,0,1)[0]=="1EHNa6Q4Jz2uvNExL497mE43ikXhwF6kZm"
+assert R.derive("wif:p2wpkh",0,0,0)[0]=="bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"  # BIP173 example (k=1)
+assert R.derive("wif:p2wpkh",0,0,1)==(None,None) and R.derive("wif:p2pkh",0,1,0)==(None,None) and R.derive("wif:p2pkh",0,0,2)==(None,None)
+assert R.compressed("wif:p2pkh",0) and not R.compressed("wif:p2pkh",1)
+assert int.from_bytes(bytes(R.derive("wif:p2pkh",0,0,0)[1]),"big")==1
+R.close(); assert R.wifs==[]
+pub = list_addresses(f"{WC} {WU}","",100)
+assert len(pub)==5 and {e["address"] for e in pub} >= {"1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH","1EHNa6Q4Jz2uvNExL497mE43ikXhwF6kZm","bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"}
+print("  vectors, finite listing (5 addrs for 2 keys), key wiping ✓")
+# sign all 5 WIF address types in one tx and verify independently
+coins=[]
+for e in pub:
+    _ctr[0]+=1; k=keys_for(f"{WC} {WU}","",{e["address"]:{x:e[x] for x in ("scheme","account","chain","index")}})
+    kind,path,priv,comp=k[e["address"]]; coins.append(Coin(bytes([_ctr[0]]*32).hex(),0,60000,e["address"],kind,priv,path,comp))
+tx,*_ = build_and_sign(coins, DEST, 3)
+kinds=verify(tx.serialize(), [{"script_pubkey":spk_for_address(c.address).hex(),"value":c.value} for c in coins])
+assert sorted(kinds)==sorted(["p2pkh","p2pkh-uncompressed","p2sh-p2wpkh","p2wpkh","p2tr"]), kinds
+print("  signed 5 WIF-derived inputs (incl. uncompressed) and verified ✓", kinds)
+k=keys_for(f"{WC} {WU}","",{"1EHNa6Q4Jz2uvNExL497mE43ikXhwF6kZm":None}); assert not k["1EHNa6Q4Jz2uvNExL497mE43ikXhwF6kZm"][3]
+try: Roots(WC[:-1]+"1","",["wif:p2pkh"]); print("  FAIL"); sys.exit(1)
+except SystemExit as e: assert "Invalid private key" in str(e)
+print("  search by address, bad checksum rejected ✓")
+
 print("== F. fee-rate validation ==")
 for bad in (0,-5,None,"10",2.5):
     try: check_fee_rate(bad); print("  FAIL", bad); sys.exit(1)
