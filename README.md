@@ -69,8 +69,20 @@ while it is still online, then disconnect):
 ```bash
 git clone https://github.com/blondfrogs/btc-seed-sweeper.git
 cd btc-seed-sweeper
-python3 -m venv .venv
+./setup.sh                 # Windows: powershell -ExecutionPolicy Bypass -File setup.ps1
+```
+
+`setup.sh` finds a Python ≥ 3.10 on your machine, builds `.venv` with it, installs the pinned
+dependencies and runs the self-tests. **If your system Python is too old, it downloads a
+standalone Python 3.12 into `.venv` instead** (via [`uv`](https://github.com/astral-sh/uv),
+no admin rights needed) — so you never have to touch the system Python. Re-run it any time
+to rebuild the venv from scratch.
+
+Manual equivalent, if you'd rather not run a script:
+```bash
+python3.12 -m venv .venv          # any python >= 3.10
 .venv/bin/pip install -r requirements.txt
+.venv/bin/python tests/test_all.py
 ```
 
 Dependency versions are pinned to the audited set (see
@@ -298,8 +310,9 @@ providers; just let it run. Very large address lists take a few minutes.
 
 **"No matching distribution found for requests==2.34.2" (or coincurve==21.0.0).**
 Your Python is too old. Check with `python3 --version`: this tool needs **3.10 or newer**
-(the audited `bitcoin-utils` release uses 3.10 syntax). Install a newer Python and create
-the venv with it:
+(the audited `bitcoin-utils` release uses 3.10 syntax). Easiest fix: `./setup.sh` (or
+`setup.ps1` on Windows), which downloads a private Python 3.12 into `.venv` when the system
+one is too old. Or install a newer Python yourself and create the venv with it:
 
 - Ubuntu/Debian: `sudo apt install python3.11 python3.11-venv` then `python3.11 -m venv .venv`
 - macOS (Homebrew): `brew install python@3.12` then `python3.12 -m venv .venv`
