@@ -1,8 +1,5 @@
-# Audited set (see README "Verifying the dependencies yourself").
+# Audited set (see README "Verifying the dependencies yourself"). Python 3.10+ required.
 bip_utils==2.12.2
 bitcoin-utils==0.8.2
 coincurve==21.0.0
-# requests is only used for read-only HTTP lookups (never touches keys).
-# 2.34.x needs Python >= 3.10; older Pythons get the last compatible release.
-requests==2.34.2; python_version >= "3.10"
-requests==2.32.5; python_version == "3.9"
+requests==2.34.2

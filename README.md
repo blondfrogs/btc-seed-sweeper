@@ -54,7 +54,7 @@ signed hex instead of sending it, so you get a final chance to review before any
   passphrase ("25th word") if you ever set one. Most people didn't.
 - **A new wallet** with a receive address to sweep into. Any modern wallet works
   (Sparrow, Electrum, BlueWallet, a hardware wallet, …). Use a `bc1q…` address if offered.
-- **Python 3.9 or newer** on each machine you'll use (`python3 --version` to check).
+- **Python 3.10 or newer** on each machine you'll use (`python3 --version` to check).
 - For the air-gapped flow: **a second computer that you can keep offline**, and a USB stick
   (or a phone camera for QR / retyping — the files are small). A live-USB Linux boot of a
   laptop with Wi-Fi turned off is a good offline machine.
@@ -296,9 +296,17 @@ providers; just let it run. Very large address lists take a few minutes.
 - "bad-txns-inputs-missingorspent": the coins were spent between `fetch` and broadcast, or
   `utxos.json` is stale. Re-run `fetch`.
 
-**"No matching distribution found for requests==2.34.2".**
-Your Python is older than 3.10. `requirements.txt` handles Python 3.9 automatically; if
-you're on 3.8 or older, install a newer Python (3.9+ is required by `coincurve`).
+**"No matching distribution found for requests==2.34.2" (or coincurve==21.0.0).**
+Your Python is too old. Check with `python3 --version`: this tool needs **3.10 or newer**
+(the audited `bitcoin-utils` release uses 3.10 syntax). Install a newer Python and create
+the venv with it:
+
+- Ubuntu/Debian: `sudo apt install python3.11 python3.11-venv` then `python3.11 -m venv .venv`
+- macOS (Homebrew): `brew install python@3.12` then `python3.12 -m venv .venv`
+- Windows: install from https://python.org, then `py -3.12 -m venv .venv`
+- Any OS, no admin rights: `pip install uv` then `uv venv --python 3.12 .venv`
+
+Then `.venv/bin/pip install -r requirements.txt` as usual.
 
 **Windows users:** replace `.venv/bin/python` with `.venv\Scripts\python`.
 
@@ -367,9 +375,7 @@ supported as a destination.
 ## Verifying the dependencies yourself
 
 `requirements.txt` pins `bip_utils==2.12.2`, `bitcoin-utils==0.8.2`, `coincurve==21.0.0`
-and `requests==2.34.2` (on Python 3.9, where 2.34 isn't available, it selects
-`requests==2.32.5` instead — `requests` only does read-only HTTP lookups and never touches
-keys).
+and `requests==2.34.2`.
 These versions were audited by:
 
 1. Re-downloading each wheel from PyPI and SHA-256-comparing **every installed file** against

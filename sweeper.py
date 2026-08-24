@@ -23,7 +23,6 @@ import ctypes
 import gc
 import getpass
 import json
-import resource
 import sys
 import time
 import unicodedata
@@ -51,8 +50,9 @@ GAP_LIMIT = 20          # unused addresses in a row before we stop scanning a ch
 DUST = 546              # sats
 btc_setup("mainnet")
 
-# Never let a crash write process memory (and the seed) to disk.
+# Never let a crash write process memory (and the seed) to disk (Unix only).
 try:
+    import resource
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 except Exception:
     pass
